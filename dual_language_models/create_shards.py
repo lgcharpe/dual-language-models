@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import requests
 from tqdm import tqdm
 import zstandard as zstd
@@ -13,8 +14,13 @@ def parse_args():
     parser.add_argument("--intermediate_path", type=str, default="data/hplt_2_8b_raw/{}.jsonl.zst")
     parser.add_argument("--output_path", type=str, default="data/hplt_2_32b_text_shards/{}.jsonl")
     parser.add_argument("--text_column", type=str, default="text")
+    parser.add_argument("--use_local_files", action="store_true", help="Use local intermediate files and skip URL download")
     parser.add_argument("--total_size", type=int, default=2048*2048*2048*4)
     return parser.parse_args()
+
+
+def is_url(value):
+    return value.startswith("http://") or value.startswith("https://")
 
 
 def iter_zst_lines(file_path, encoding='utf-8'):
@@ -102,23 +108,38 @@ def iter_input_texts(file_path, text_column="text"):
 if __name__ == "__main__":
     args = parse_args()
 
-    for i in tqdm(range(args.n_input_shards), desc="Downloading input shards"):
-        url_path = args.url_path.format(i + 1)
-        output_path = args.intermediate_path.format(i)
+    use_local_files = args.use_local_files or not is_url(args.url_path)
 
-        bytes_to_download = args.total_size // args.n_input_shards * 8  # assuming 8 bytes per word
+    if not use_local_files:
+        for i in tqdm(range(args.n_input_shards), desc="Downloading input shards"):
+            url_path = args.url_path.format(i + 1)
+            output_path = args.intermediate_path.format(i)
 
-        headers = {
-            "Range": f"bytes=0-{bytes_to_download - 1}"
-        }
+            bytes_to_download = args.total_size // args.n_input_shards * 8  # assuming 8 bytes per word
 
-        response = requests.get(url_path, headers=headers, stream=True)
-        response.raise_for_status()
+            headers = {
+                "Range": f"bytes=0-{bytes_to_download - 1}"
+            }
 
-        with open(output_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+            response = requests.get(url_path, headers=headers, stream=True)
+            response.raise_for_status()
+
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+    else:
+        missing_paths = [
+            args.intermediate_path.format(i)
+            for i in range(args.n_input_shards)
+            if not os.path.exists(args.intermediate_path.format(i))
+        ]
+        if missing_paths:
+            first_missing = missing_paths[0]
+            raise FileNotFoundError(
+                f"Local input file not found: {first_missing}. "
+                "Provide existing files via --intermediate_path or disable --use_local_files."
+            )
 
     # Open documents
     input_files = [
