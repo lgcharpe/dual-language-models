@@ -10,6 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_shards", type=int, default=256)
     parser.add_argument("--input_path", type=str, default="data/hplt_2_32b_text_shards/{}.jsonl")
+    parser.add_argument("--text_column", type=str, default="text")
     parser.add_argument("--output_path", type=str, default="data/hplt_2_32b_token_shards/{}.bin")
     parser.add_argument("--output_valid_path", type=str, default="data/hplt_2_32b_valid_token_shards/{}.bin")
     parser.add_argument("--tokenizer_path", type=str, default="tokenizers/tokenizer.json")
@@ -34,7 +35,8 @@ def main():
             Path(output_file),
             Path(output_valid_file),
             max_size=args.total_size // args.n_shards,
-            verbose=True
+            verbose=True,
+            text_column=args.text_column
         )
 
     print("Tokenization complete.")

@@ -3,7 +3,7 @@ import json
 import os
 import requests
 from tqdm import tqdm
-import zstandard as zstd
+from dual_language_models.data_utils import iter_input_texts
 
 
 def parse_args():
@@ -21,88 +21,6 @@ def parse_args():
 
 def is_url(value):
     return value.startswith("http://") or value.startswith("https://")
-
-
-def iter_zst_lines(file_path, encoding='utf-8'):
-    with open(file_path, 'rb') as f:
-        dctx = zstd.ZstdDecompressor()
-        stream_reader = dctx.stream_reader(f)
-
-        buffer = b""
-        while True:
-            chunk = stream_reader.read(8192)
-            if not chunk:
-                break
-            buffer += chunk
-            while b'\n' in buffer:
-                line, buffer = buffer.split(b'\n', 1)
-                try:
-                    yield line.decode(encoding)
-                except UnicodeDecodeError:
-                    return  # stop on malformed line at truncation
-        # Optional: yield last line if it looks complete
-        if buffer.strip():
-            try:
-                yield buffer.decode(encoding)
-            except UnicodeDecodeError:
-                pass  # ignore partial/broken line
-
-
-def iter_jsonl_lines(file_path, encoding='utf-8'):
-    with open(file_path, "r", encoding=encoding) as f:
-        for line in f:
-            yield line
-
-
-def iter_text_from_arrow_or_parquet(file_path, text_column="text"):
-    try:
-        import pyarrow.dataset as ds
-    except ImportError as exc:
-        raise ImportError(
-            "Reading Arrow/Parquet input requires `pyarrow`. "
-            "Install it with: pip install pyarrow"
-        ) from exc
-
-    lower_path = file_path.lower()
-    if lower_path.endswith(".parquet"):
-        dataset = ds.dataset(file_path, format="parquet")
-    elif lower_path.endswith(".arrow") or lower_path.endswith(".feather"):
-        dataset = ds.dataset(file_path, format="ipc")
-    else:
-        raise ValueError(f"Unsupported tabular format for file: {file_path}")
-
-    scanner = dataset.scanner(columns=[text_column])
-    for batch in scanner.to_batches():
-        for value in batch.column(text_column).to_pylist():
-            if value is None:
-                continue
-            yield str(value)
-
-
-def iter_input_texts(file_path, text_column="text"):
-    lower_path = file_path.lower()
-
-    if lower_path.endswith(".jsonl.zst"):
-        for line in iter_zst_lines(file_path):
-            sample = json.loads(line)
-            text = sample.get(text_column)
-            if text is not None:
-                yield str(text)
-        return
-
-    if lower_path.endswith(".jsonl"):
-        for line in iter_jsonl_lines(file_path):
-            sample = json.loads(line)
-            text = sample.get(text_column)
-            if text is not None:
-                yield str(text)
-        return
-
-    if lower_path.endswith(".parquet") or lower_path.endswith(".arrow") or lower_path.endswith(".feather"):
-        yield from iter_text_from_arrow_or_parquet(file_path, text_column=text_column)
-        return
-
-    raise ValueError(f"Unsupported input format for file: {file_path}")
 
 
 if __name__ == "__main__":

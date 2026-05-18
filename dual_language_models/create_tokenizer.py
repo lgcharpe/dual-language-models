@@ -1,6 +1,7 @@
 import argparse
 import json
 from tokenizers import Tokenizer
+from dual_language_models.data_utils import iter_input_texts
 from dual_language_models.tokenization.init_tokenizer import initialize_tokenizer
 
 
@@ -8,6 +9,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='BERT sharding')
     parser.add_argument('--num_shards', type=int, default=256, help='Number of shards to train on')
     parser.add_argument('--shard_path', type=str, default="data/hplt_2_32b_text_shards/{}.jsonl", help='Path to the shards')
+    parser.add_argument('--text_column', type=str, default='text', help='Column name containing text in json/parquet/arrow shards')
     parser.add_argument('--vocab_path', type=str, default="tokenizers/tokenizer.json", help='Specify the output filename')
     parser.add_argument('--vocab_size', type=int, default=51_200, help='Number of subwords in the trained tokenizer')
     parser.add_argument('--min_frequency', type=int, default=1, help='Minimal number of occurences of every candidate subword')
@@ -20,8 +22,8 @@ if __name__ == "__main__":
 
     def iterator():
         for shard in range(args.num_shards):
-            for line in open(args.shard_path.format(shard), 'r'):
-                text = json.loads(line).strip()
+            for text in iter_input_texts(args.shard_path.format(shard), text_column=args.text_column):
+                text = text.strip()
                 if len(text) == 0:
                     continue
                 yield text

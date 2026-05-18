@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 from tokenizers import Tokenizer
-import json
 import torch
 from tqdm import tqdm
 from pathlib import Path
+from dual_language_models.data_utils import iter_input_texts
 
 
 def tokenize(tokenizer: Tokenizer, text: str) -> torch.Tensor:
@@ -21,7 +21,15 @@ def tokenize(tokenizer: Tokenizer, text: str) -> torch.Tensor:
     return ids
 
 
-def tokenize_shard(tokenizer: Tokenizer, input_path: Path, output_path: Path, output_valid_path: Path, max_size: int, verbose=False) -> None:
+def tokenize_shard(
+    tokenizer: Tokenizer,
+    input_path: Path,
+    output_path: Path,
+    output_valid_path: Path,
+    max_size: int,
+    verbose=False,
+    text_column: str = "text"
+) -> None:
     """
     Takes an input path for a shard and saves its tokenized
     version into a given output path.
@@ -29,8 +37,12 @@ def tokenize_shard(tokenizer: Tokenizer, input_path: Path, output_path: Path, ou
     tokenized_documents = []
     tokenizer_documents_validation = []
     n_words, n_subwords = 0, 0
-    for i, line in enumerate(tqdm(input_path.open("rt"), desc=f"Tokenizing {input_path}", disable=not verbose)):
-        document = json.loads(line).strip()
+    text_iterator = iter_input_texts(input_path, text_column=text_column)
+    for i, document in enumerate(tqdm(text_iterator, desc=f"Tokenizing {input_path}", disable=not verbose)):
+        document = document.strip()
+        if not document:
+            continue
+
         tokenized_document = tokenize(tokenizer, document)
 
         if n_subwords >= max_size:
