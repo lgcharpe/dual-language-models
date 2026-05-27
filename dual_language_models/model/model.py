@@ -293,10 +293,12 @@ class SelfAttention(nn.Module):
 
         self.initialize()
 
-    def causal_mask_mode(self, b, _, q_idx, kv_idx):
+    @staticmethod
+    def causal_mask_mode(b, h, q_idx, kv_idx):
         return (q_idx >= kv_idx)
 
-    def bidirectional_mask_mode(self, b, _, q_idx, kv_idx):
+    @staticmethod
+    def bidirectional_mask_mode(b, h, q_idx, kv_idx):
         return torch.ones_like(q_idx, dtype=torch.bool)
 
     def _create_block_mask(self, device: torch.device) -> None:

@@ -337,9 +337,10 @@ class ValidationDataset:
 class ValidationCausalDataset(ValidationDataset):
 
     def iterate_over_all(self, seq_len, batch_size):
+        self.current_idx = 0  # Reset for next iteration
         while self.current_idx < self.len:
             yield self.next(seq_len, batch_size)
-        self.current_idx = 0  # Reset for next iteration
+        # self.current_idx = 0  # Reset for next iteration
 
     def next(self, current_seq_len, batch_size):
         all_input_ids, all_target_ids, all_sequence_lengths = [], [], []
@@ -425,9 +426,9 @@ class ValidationMaskedDataset(ValidationDataset):
         self.masking_strategy = SpanMaskingStrategy(args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index)
 
     def iterate_over_all(self, seq_len, batch_size):
+        self.current_idx = 0  # Reset for next iteration
         while self.current_idx < self.len:
             yield self.next(seq_len, batch_size)
-        self.current_idx = 0  # Reset for next iteration
 
     def next(self, current_seq_len, batch_size):
         all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []

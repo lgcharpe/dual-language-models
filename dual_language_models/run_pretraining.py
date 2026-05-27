@@ -185,7 +185,7 @@ def prepare_model_and_optimizer(args):
     model.cuda(args.device)
     model.create_mask(args.device)
 
-    # model = torch.compile(model)
+    model = torch.compile(model)
 
     ddp_model = DDP(
         model,
@@ -245,11 +245,24 @@ def prepare_model_and_optimizer(args):
     if args.checkpoint_foldername is not None:
         path_to_checkpoint = args.checkpoint_foldername / "state_dict.bin"
         state_dict = torch.load(path_to_checkpoint, map_location=args.device)
-        model.load_state_dict(state_dict["model"])
-        optimizer.load_state_dict(state_dict["optimizer"])
-        lr_scheduler.load_state_dict(state_dict["lr_schedulers"])
-        mask_scheduler.load_state_dict(state_dict["mask_scheduler"])
-        global_step = state_dict["global_step"]
+        # Support both old format (raw state dict) and new format (dict with keys)
+        if "model" in state_dict:
+            model_state = state_dict["model"]
+            optimizer.load_state_dict(state_dict["optimizer"])
+            lr_scheduler.load_state_dict(state_dict["lr_schedulers"])
+            mask_scheduler.load_state_dict(state_dict["mask_scheduler"])
+            global_step = state_dict["global_step"]
+        else:
+            print("Warning: checkpoint is in legacy format — optimizer/scheduler state not restored.", flush=True)
+            model_state = state_dict
+        # Align "_orig_mod." prefix between checkpoint and model (torch.compile adds this prefix)
+        ckpt_has_prefix = any(k.startswith("_orig_mod.") for k in model_state)
+        model_has_prefix = any(k.startswith("_orig_mod.") for k in model.state_dict())
+        if ckpt_has_prefix and not model_has_prefix:
+            model_state = {k.removeprefix("_orig_mod."): v for k, v in model_state.items()}
+        elif not ckpt_has_prefix and model_has_prefix:
+            model_state = {"_orig_mod." + k: v for k, v in model_state.items()}
+        model.load_state_dict(model_state)
 
     return model, ddp_model, optimizer, lr_scheduler, mask_scheduler, global_step
 
@@ -509,7 +522,13 @@ def save(model, optimizer, lr_scheduler, mask_scheduler, global_step, train_data
     path_to_save_folder.mkdir(parents=True, exist_ok=True)
     if is_main_process():
         torch.save(
-            model.state_dict(),
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "lr_schedulers": lr_scheduler.state_dict(),
+                "mask_scheduler": mask_scheduler.state_dict(),
+                "global_step": global_step,
+            },
             path_to_save_folder / "state_dict.bin"
         )
         # torch.save(
@@ -526,7 +545,13 @@ def save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step,
     path_to_save_folder.mkdir(parents=True, exist_ok=True)
     if is_main_process():
         torch.save(
-            model.state_dict(),
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "lr_schedulers": lr_scheduler.state_dict(),
+                "mask_scheduler": mask_scheduler.state_dict(),
+                "global_step": global_step,
+            },
             path_to_save_folder / "state_dict.bin"
         )
         # torch.save(
