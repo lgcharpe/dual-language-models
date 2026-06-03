@@ -6,6 +6,10 @@ from torch.nn import functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 import math
+from functools import partial
+
+from liger_kernel.transformers import LigerRMSNorm, LigerCrossEntropyLoss, liger_rotary_pos_emb
+from liger_kernel.ops import LigerSiLUMulFunction
 
 
 class ModelOutput:
@@ -76,8 +80,7 @@ class MultiCastedLinearOrtho(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
+    def forward(self, gate, x):
         x = x * F.silu(gate)
         return x
 
@@ -94,6 +97,10 @@ class Model(nn.Module):
         self.embedding = Embedding(config)
         self.encoder = Encoder(config)
         self.classifier = Classifier(config, self.embedding.word_embedding.weight)
+        if config.use_liger:
+            self.loss_fn = LigerCrossEntropyLoss(reduction='none')
+        else:
+            self.loss_fn = partial(F.cross_entropy, reduction='none')
 
     def change_model_type(self, model_type: str, device: torch.device):
         for layer in self.encoder.layers:
@@ -136,7 +143,7 @@ class Model(nn.Module):
             gold_labels = labels.flatten()
             gold_labels = gold_labels[gold_labels != -100]
 
-            output.loss = F.cross_entropy(logits, gold_labels, reduction='none')
+            output.loss = self.loss_fn(logits, gold_labels)
             output.perplexity = torch.exp(output.loss)
             output.z_loss = torch.logsumexp(logits, dim=-1).pow(2)
 
@@ -230,7 +237,10 @@ class Classifier(nn.Module):
         self.emb2vocab: CastedLinear
         self.pre_norm: nn.RMSNorm
 
-        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
+        if config.use_liger:
+            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
+        else:
+            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
         self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
         self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=True)
 
@@ -283,7 +293,10 @@ class SelfAttention(nn.Module):
         self.qkv_proj = MultiCastedLinearOrtho(self.hidden_size, [self.hidden_size, self.hidden_size, self.hidden_size], bias=False)
         self.out_proj = CastedLinear(self.d_h*self.num_attention_heads, self.hidden_size, bias=False)
 
-        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
+        if config.use_liger:
+            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
+        else:
+            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
 
         self.rope_embedding = RotaryPositionalEmbeddings(config)
         self.scale: float = 1.0 / math.sqrt(self.d_h)
@@ -359,9 +372,15 @@ class FeedForward(nn.Module):
         self.pre_norm: nn.RMSNorm
         self.activation: SwiGLU
 
-        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
+        if config.use_liger:
+            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
+        else:
+            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
         self.up_proj = MultiCastedLinearOrtho(config.hidden_size, [config.intermediate_size, config.intermediate_size], bias=False)
-        self.activation = SwiGLU()
+        if config.use_liger:
+            self.activation = LigerSiLUMulFunction.apply
+        else:
+            self.activation = SwiGLU()
         self.down_proj = CastedLinear(config.intermediate_size, config.hidden_size, bias=False)
 
         self.initialize(config.hidden_size)
@@ -381,7 +400,9 @@ class FeedForward(nn.Module):
     def activate(self, projection: torch.Tensor) -> torch.Tensor:
         activated_projection: torch.Tensor
 
-        activated_projection = self.activation(projection)
+        x, gate = projection.chunk(2, dim=-1)
+
+        activated_projection = self.activation(gate, x)
 
         return activated_projection
 
