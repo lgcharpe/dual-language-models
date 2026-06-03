@@ -22,6 +22,20 @@ def _liger_rotary_pos_emb_eager(
     return liger_rotary_pos_emb(q, k, cos_matrix, sin_matrix)
 
 
+@torch._dynamo.disable
+def _flex_attention_with_doc_mask(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask,
+    doc_ids: torch.Tensor,
+) -> torch.Tensor:
+    def document_score_mod(score, b, _, q_idx, kv_idx):
+        return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
+
+    return flex_attention(query, key, value, block_mask=block_mask, score_mod=document_score_mod)
+
+
 class ModelOutput:
 
     def __init__(
@@ -358,11 +372,8 @@ class SelfAttention(nn.Module):
 
         query, key = self.rope_embedding(query, key)
 
-        def document_score_mod(score, b, _, q_idx, kv_idx):
-            return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
-
-        output = flex_attention(
-            query, key, value, block_mask=self.mask, score_mod=document_score_mod
+        output = _flex_attention_with_doc_mask(
+            query, key, value, self.mask, doc_ids
         )
 
         output = output.permute(2, 0, 1, 3).flatten(2, 3)  # shape: [T, B, H*D]
