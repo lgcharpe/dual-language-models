@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 class Datasetv2:
 
-    def __init__(self: Datasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, rank: int, seed: int, shuffle: bool = True) -> None:
+    def __init__(self: Datasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], seed: int, shuffle: bool = True) -> None:
         self.dataset = dataset
         self.seq_length = seq_length
         self.n_special_tokens = args.n_special_tokens
@@ -24,18 +24,23 @@ class Datasetv2:
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
 
-        all_documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
-        total_num_tokens = sum(len(doc) for doc in all_documents)
-        remaining_num_tokens = total_num_tokens // args.n_repetitions
+        # all_documents = []
         self.documents = []
-        while remaining_num_tokens > 0:
-            document = all_documents[len(self.documents)][:remaining_num_tokens]
-            self.documents.append(document)
-            remaining_num_tokens -= len(document)
+        for rank in ranks:
+            documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
+            self.documents.extend(documents)
+            print(f"Dataset {dataset}/{rank:d}.bin loaded", flush=True)
+        # total_num_tokens = sum(len(doc) for doc in all_documents)
+        # remaining_num_tokens = total_num_tokens // args.n_repetitions
+        # self.documents = []
+        # while remaining_num_tokens > 0:
+        #     document = all_documents[len(self.documents)][:remaining_num_tokens]
+        #     self.documents.append(document)
+        #     remaining_num_tokens -= len(document)
 
         self.inputs, self.outputs, self.doc_ids = self.chunk()
 
-        print(f"Dataset {dataset}/{rank:d} loaded", flush=True)
+        print(f"Dataset initialized with {len(self.inputs)} sequences", flush=True)
 
     def chunk(self: Datasetv2) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         if self.shuffle:
@@ -301,10 +306,116 @@ class DiffusionMaskingStrategy:
         replacement_tokens.fill_(self.mask_token_id)
 
         return mask_ratios, replacement_tokens
+    
+
+class FusedDatasetv2(Datasetv2):
+    def __init__(self: FusedDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], mode: str = "causal", shuffle: bool = True):
+        super().__init__(dataset, tokenizer, args, seq_length, ranks, args.seed, shuffle)
+        self.mode = mode
+        if mode == "causal":
+            self.masking_strategy = None
+        elif mode == "masked":
+            self.masking_strategy = SpanMaskingStrategy(
+                n_special_tokens=args.n_special_tokens,
+                random_p=args.random_p,
+                keep_p=args.keep_p,
+                vocab_size=args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+        else:  # diffusion
+            self.masking_strategy = DiffusionMaskingStrategy(
+                n_special_tokens=args.n_special_tokens,
+                vocab_size=args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+
+    def set_mode(self, mode: Literal["causal", "diffusion", "masked"]) -> None:
+        """Switch the masking strategy without reloading data."""
+        self.mode = mode
+        if mode == "causal":
+            self.masking_strategy = None
+        elif mode == "masked":
+            self.masking_strategy = SpanMaskingStrategy(
+                n_special_tokens=self.args.n_special_tokens,
+                random_p=self.args.random_p,
+                keep_p=self.args.keep_p,
+                vocab_size=self.args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+        elif mode == "diffusion":
+            self.masking_strategy = DiffusionMaskingStrategy(
+                n_special_tokens=self.args.n_special_tokens,
+                vocab_size=self.args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+    def next(self, current_seq_len, batch_size):
+        all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
+        for _ in range(batch_size):
+            input_ids, target_ids, sequence_lengths, real_mask_p = self.__getitem__(self.current_idx)
+            self.current_idx += 1
+            if self.current_idx >= len(self.inputs):
+                if self.shuffle:
+                    self.iterations += 1
+                    self.inputs, self.outputs, self.doc_ids = self.chunk()
+                    print("Dataset reloaded")
+                self.current_idx = 0
+
+            all_input_ids.append(input_ids)
+            all_target_ids.append(target_ids)
+            all_sequence_lengths.append(sequence_lengths)
+            all_real_mask_p.append(real_mask_p)
+
+        input_ids = torch.stack(all_input_ids)
+        target_ids = torch.stack(all_target_ids)
+        sequence_lengths = torch.stack(all_sequence_lengths)
+        
+        if self.mode == "causal":
+            mask_p_out = torch.zeros([])
+        elif self.mode == "diffusion":
+            mask_p_out = torch.stack(all_real_mask_p)      # (batch, seq)
+        else:  # "masked"
+            mask_p_out = torch.stack(all_real_mask_p).mean()  # scalar
+
+        return input_ids, target_ids, sequence_lengths, mask_p_out
+
+    def apply_mask(self, input_ids, target_ids, mask_ratios, replacement_ids):
+        if self.mode == "masked":
+            mask_p = self.args.mask_p
+        else:  # diffusion
+            mask_p = torch.rand(1).item()
+        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
+
+        mask = mask_ratios <= mask_p
+        target_mask = torch.cat([mask[1:], torch.ones(1, dtype=torch.bool)])
+        target_ids = torch.where(target_mask, target_ids, -100)
+        input_ids = torch.where(mask, replacement_ids, input_ids)
+
+        real_mask_p = mask.sum() / mask_ratios.numel()
+        if self.mode == "diffusion":
+            real_mask_p = torch.full_like(input_ids, real_mask_p, dtype=torch.float)
+            real_mask_p = (1 - 1e-4) * real_mask_p + 1e-4
+
+        return input_ids, target_ids, real_mask_p
+    
+    def __getitem__(self, index):
+        input_ids = self.inputs[index].long()
+        target_ids = self.outputs[index].long()
+        sequence_lengths = self.doc_ids[index]
+
+        if self.masking_strategy is not None:
+            mask_ratios, replacement_tokens = self.masking_strategy(input_ids)
+            input_ids, target_ids, real_mask_p = self.apply_mask(input_ids, target_ids, mask_ratios, replacement_tokens)
+        else:
+            real_mask_p = torch.zeros([])
+        
+        return input_ids, target_ids, sequence_lengths, real_mask_p
 
 
 class ValidationDataset:
-    def __init__(self, dataset: str, tokenizer, args, seq_length, rank):
+    def __init__(self, dataset: str, tokenizer, args, seq_length, ranks):
         self.dataset = dataset
         self.max_seq_length = seq_length + 1
         self.n_special_tokens = args.n_special_tokens
@@ -319,10 +430,15 @@ class ValidationDataset:
         self.orders = []
         self.lens = []
         self.seed = args.seed
-        documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
+        self.documents = []
+        for rank in ranks:
+            documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
+            self.documents.extend(documents)
+            print(f"Dataset {dataset}/{rank:d}.bin loaded", flush=True)
+        # documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
         for i, document in enumerate(documents):
-            if i % args.document_skip != 0:
-                continue
+            # if i % args.document_skip != 0:
+            #     continue
 
             document = torch.cat([torch.LongTensor([self.cls_index]), document])
             self.doc_segments += [
@@ -332,6 +448,8 @@ class ValidationDataset:
             ]
         self.len = len(self.doc_segments)
         self.current_idx = 0
+
+        print(f"Validation dataset loaded with {self.len} segments", flush=True)
 
 
 class ValidationCausalDataset(ValidationDataset):

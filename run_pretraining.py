@@ -20,12 +20,16 @@ import torch._dynamo
 from dual_language_models.model.model import Model
 from dual_language_models.optimizers.kimi_muon import Muon
 from dual_language_models.utils import trapezoid_schedule, MaskScheduler, is_main_process, seed_everything
-from dual_language_models.pretraining.dataset import ValidationCausalDataset, ValidationMaskedDataset, DiffusionDatasetv2, CausalDatasetv2
+from dual_language_models.pretraining.dataset import ValidationCausalDataset, ValidationMaskedDataset, FusedDatasetv2
+from dual_language_models.metrics import TrainingMetrics
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.suppress_errors = True
 
 
-if int(os.environ["SLURM_PROCID"]) == 0:
+# if int(os.environ["SLURM_PROCID"]) == 0:
+#     import wandb
+
+if int(os.environ["RANK"]) == 0:
     import wandb
 
 
@@ -58,7 +62,7 @@ def parse_arguments():
     parser.add_argument('--seed', type=int, default=42, help="random seed for initialization")
     parser.add_argument('--save_every', type=int, default=100, help="save every X steps")
     parser.add_argument("--checkpoint_style", default="exp", type=str, help="The style of checkpointing", choices=["linear", "exp"])
-    parser.add_argument("--first_checkpoint", default=64.0, type=float, help="Represents the number of tokens/steps at which to save the first checkpoint.")
+    parser.add_argument("--first_checkpoint", default=500.0, type=float, help="Represents the number of tokens/steps at which to save the first checkpoint.")
     parser.add_argument('--checkpoint_every', type=int, default=1e8, help="create a model chekpoint every X tokens/steps after the initial checkpoint.")
     parser.add_argument("--checkpoint_mult", default=math.sqrt(2), type=float, help="Checkpoint every power of X steps/tokens (times a initial checkpoint).")
     parser.add_argument("--checkpoint_on", default="steps", type=str, help="What to checkpoint on.")
@@ -80,6 +84,7 @@ def parse_arguments():
     parser.add_argument("--untie", default=True, action="store_true")
     parser.add_argument("--momentum", default=0.95, type=float)
     parser.add_argument("--n_repetitions", default=64, type=int, help="Number of times to repeat the dataset.")
+    parser.add_argument("--num_shards", default=128, type=int, help="Number of data shards (per dataset type). Should be at least the number of GPUs.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +115,9 @@ def setup_training(args, tokenizer):
         args.cooldown_checkpoint = -1
 
     args.world_size = int(os.environ["WORLD_SIZE"])
-    args.rank = int(os.environ["SLURM_PROCID"])
+    # args.rank = int(os.environ["SLURM_PROCID"])
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+    args.rank = int(os.environ["RANK"])
     args.gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
     assert args.gpus_per_node == torch.cuda.device_count()  # Might create errors on ROCm
     print(f"Hello from rank {args.rank} of {args.world_size} on {gethostname()} where there are {args.gpus_per_node} allocated GPUs per node.", flush=True)
@@ -124,7 +131,7 @@ def setup_training(args, tokenizer):
         args.dataset_type = "causal"
     print(f"Dataset type: {args.dataset_type}", flush=True)
 
-    args.local_rank = args.rank % args.gpus_per_node
+    # args.local_rank = args.rank % args.gpus_per_node
 
     dist.init_process_group(
         backend="nccl",
@@ -136,7 +143,9 @@ def setup_training(args, tokenizer):
 
     seed_everything(args.seed + args.rank)
 
-    args.shard_rank = args.rank
+    num_shards_per_gpu = args.num_shards // args.world_size
+    args.shard_ranks = [i for i in range(args.rank * num_shards_per_gpu, (args.rank + 1) * num_shards_per_gpu)]
+    # args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device("cuda", args.local_rank)
     print(f"RCCL started on device {args.device}", flush=True)
@@ -288,14 +297,23 @@ def _do_checkpoint(global_step, args):
     return False
 
 
-def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_dataset, valid_diffusion_dataset, valid_causal_dataset, optimizer, lr_scheduler, mask_scheduler, global_step, args):
+def training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, valid_causal_dataset, optimizer, lr_scheduler, mask_scheduler, global_step, args):
     if args.checkpoint_init and global_step == 0:
-        save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step, 0, train_diffusion_dataset, args)
+        save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step, 0, train_dataset, args)
 
     model = model.train()
     model.zero_grad(set_to_none=True)
 
-    train_dataset = train_diffusion_dataset if args.dataset_type == "masked" else train_causal_dataset
+    if is_main_process():
+        training_metrics = TrainingMetrics(
+            num_params=sum(p.numel() for p in model.parameters() if p.requires_grad),
+            seq_len=args.max_seq_length,
+            world_size=args.world_size,
+            device=args.device,
+            peak_flops_per_sec=989e12  # Set this if you have the peak FLOPS of your device
+        )
+
+    train_dataset.set_mode("diffusion" if args.dataset_type == "masked" else "causal")
 
     # initialize the dataloader and the metrics
     total_loss, total_accuracy, total_z_loss, total_mask_p, total_grad_norm = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -307,6 +325,10 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
     # Initialize the progress bar
     progress_bar = tqdm(total=args.max_steps, initial=global_step, disable=not is_main_process(), desc="Train iteration")
 
+    # Start the timer
+    if is_main_process():
+        training_metrics.step_start()
+
     # iterate over the steps
     for local_step in range(num_steps):
         epoch = global_step // args.steps_in_epoch
@@ -316,7 +338,7 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
             dataset_type = "causal"
         if dataset_type != args.dataset_type:
             args.dataset_type = dataset_type
-            train_dataset = train_diffusion_dataset if dataset_type == "masked" else train_causal_dataset
+            train_dataset.set_mode("diffusion" if args.dataset_type == "masked" else "causal")
             model.change_model_type(dataset_type, args.device)
 
         next_batch = get_batch(args, train_dataset, global_step)
@@ -334,7 +356,7 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
             if args.dataset_type == "masked":
                 weight = 1.0 / mask_p[target_ids != -100]
             else:
-                weight = 2.0
+                weight = 1.0
             
             loss = (loss / input_ids.numel() * weight).sum() / args.accumulate_steps
             z_loss = (z_loss / input_ids.numel() * weight).sum() / args.accumulate_steps
@@ -362,6 +384,8 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
         optimizer.step()
         lr_scheduler.step()
         args.mask_p = mask_scheduler.step()
+        if is_main_process():
+            step_timings = training_metrics.step_end(args.global_batch_size)
 
         with torch.no_grad():
             # be careful here, not all GPUs work with the same training objective
@@ -404,9 +428,17 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
                         "stats/mask_p": total_mask_p,
                         "global_step": global_step,
                         "tokens_trained": tokens_trained,
+                        "time/step_time": step_timings.step_time_ms,
+                        "time/samples_per_sec": step_timings.samples_per_sec,
+                        "time/tokens_per_sec": step_timings.tokens_per_sec,
+                        "time/flops_per_step": step_timings.flops_per_step,
+                        "memory/allocated_mb": step_timings.memory_allocated_mb,
+                        "memory/reserved_mb": step_timings.memory_reserved_mb,
+                        "time/mfu": step_timings.mfu,
                     },
                     step=global_step
                 )
+                wandb.log(training_metrics.get_smoothed(), step=global_step)
 
         # zero the accumulated gradients and the metrics
         model.zero_grad(set_to_none=True)
@@ -434,6 +466,9 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
         if global_step >= args.max_steps:
             progress_bar.close()
             return
+
+        if is_main_process():
+            training_metrics.step_start()
 
     progress_bar.close()
 
@@ -561,13 +596,15 @@ def save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step,
 
 
 def load_train_dataset(args, tokenizer):
-    valid_diffusion_dataset = ValidationMaskedDataset(args.valid_path, tokenizer, args, args.max_seq_length, args.shard_rank)
-    valid_causal_dataset = ValidationCausalDataset(args.valid_path, tokenizer, args, args.max_seq_length, args.shard_rank)
+    valid_diffusion_dataset = ValidationMaskedDataset(args.valid_path, tokenizer, args, args.max_seq_length, args.shard_ranks)
+    valid_causal_dataset = ValidationCausalDataset(args.valid_path, tokenizer, args, args.max_seq_length, args.shard_ranks)
 
-    train_diffusion_dataset = DiffusionDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_rank, shuffle=True)
-    train_causal_dataset = CausalDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_rank, shuffle=True)
+    train_dataset = FusedDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
 
-    return train_diffusion_dataset, train_causal_dataset, valid_diffusion_dataset, valid_causal_dataset
+    # train_diffusion_dataset = DiffusionDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
+    # train_causal_dataset = CausalDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
+
+    return train_dataset, valid_diffusion_dataset, valid_causal_dataset
 
 
 if __name__ == "__main__":
@@ -578,8 +615,8 @@ if __name__ == "__main__":
 
     setup_training(args, tokenizer)
     model, ddp_model, optimizer, lr_scheduler, mask_scheduler, global_step = prepare_model_and_optimizer(args)
-    train_diffusion_dataset, train_causal_dataset, valid_diffusion_dataset, valid_causal_dataset = load_train_dataset(args, tokenizer)
+    train_dataset, valid_diffusion_dataset, valid_causal_dataset = load_train_dataset(args, tokenizer)
 
-    training_loop(model, ddp_model, train_diffusion_dataset, train_causal_dataset, valid_diffusion_dataset, valid_causal_dataset, optimizer, lr_scheduler, mask_scheduler, global_step, args)
+    training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, valid_causal_dataset, optimizer, lr_scheduler, mask_scheduler, global_step, args)
 
-    save(model, optimizer, lr_scheduler, mask_scheduler, args.max_steps, train_diffusion_dataset, args)
+    save(model, optimizer, lr_scheduler, mask_scheduler, args.max_steps, train_dataset, args)
