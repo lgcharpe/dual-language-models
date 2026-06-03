@@ -8,18 +8,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import math
 from functools import partial
 
-from liger_kernel.transformers import LigerRMSNorm, LigerCrossEntropyLoss, liger_rotary_pos_emb
-from liger_kernel.ops import LigerSiLUMulFunction
-
-
-@torch._dynamo.disable
-def _liger_rotary_pos_emb_eager(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos_matrix: torch.Tensor,
-    sin_matrix: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return liger_rotary_pos_emb(q, k, cos_matrix, sin_matrix)
+from liger_kernel.transformers import LigerCrossEntropyLoss
 
 
 @torch._dynamo.disable
@@ -261,10 +250,7 @@ class Classifier(nn.Module):
         self.emb2vocab: CastedLinear
         self.pre_norm: nn.RMSNorm
 
-        if config.use_liger:
-            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
-        else:
-            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
+        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
         self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
         self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=True)
 
@@ -317,10 +303,7 @@ class SelfAttention(nn.Module):
         self.qkv_proj = MultiCastedLinearOrtho(self.hidden_size, [self.hidden_size, self.hidden_size, self.hidden_size], bias=False)
         self.out_proj = CastedLinear(self.d_h*self.num_attention_heads, self.hidden_size, bias=False)
 
-        if config.use_liger:
-            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
-        else:
-            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
+        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
 
         self.rope_embedding = RotaryPositionalEmbeddings(config)
         self.scale: float = 1.0 / math.sqrt(self.d_h)
@@ -392,15 +375,9 @@ class FeedForward(nn.Module):
         self.pre_norm: nn.RMSNorm
         self.activation: SwiGLU
 
-        if config.use_liger:
-            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
-        else:
-            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
+        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
         self.up_proj = MultiCastedLinearOrtho(config.hidden_size, [config.intermediate_size, config.intermediate_size], bias=False)
-        if config.use_liger:
-            self.activation = LigerSiLUMulFunction.apply
-        else:
-            self.activation = SwiGLU()
+        self.activation = SwiGLU()
         self.down_proj = CastedLinear(config.intermediate_size, config.hidden_size, bias=False)
 
         self.initialize(config.hidden_size)
@@ -506,7 +483,6 @@ class RotaryPositionalEmbeddings(nn.Module):
         embedding = torch.cat([embedding, embedding], dim=-1).unsqueeze(0)
         self.register_buffer("cos_matrix", embedding.cos(), persistent=False)
         self.register_buffer("sin_matrix", embedding.sin(), persistent=False)
-        self.use_liger = bool(config.use_liger)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len: int
@@ -516,13 +492,8 @@ class RotaryPositionalEmbeddings(nn.Module):
 
         seq_len = q_layer.size(2)
 
-        if self.use_liger:
-            q_layer, k_layer = _liger_rotary_pos_emb_eager(
-                q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len]
-            )
-        else:
-            q_layer, k_layer = apply_rotary_pos_emb(
-                q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len]
-            )
+        q_layer, k_layer = apply_rotary_pos_emb(
+            q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len]
+        )
 
         return q_layer.type_as(q), k_layer.type_as(k)
