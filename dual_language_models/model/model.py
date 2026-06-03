@@ -346,8 +346,7 @@ class SelfAttention(nn.Module):
         key = key.reshape(key_length, batch_size, self.num_attention_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
         value = value.reshape(key_length, batch_size, self.num_attention_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
 
-        query = self.rope_embedding(query)
-        key = self.rope_embedding(key)
+        query, key = self.rope_embedding(query, key)
 
         def document_score_mod(score, b, _, q_idx, kv_idx):
             return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
@@ -423,6 +422,40 @@ class FeedForward(nn.Module):
         return output
 
 
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos_matrix: torch.Tensor, sin_matrix: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    seq_len: int
+    cos_matrix: torch.Tensor
+    sin_matrix: torch.Tensor
+    q_rotate_half: torch.Tensor
+    k_rotate_half: torch.Tensor
+    q_out: torch.Tensor
+    k_out: torch.Tensor
+
+    cos_matrix = cos_matrix[:, None, :, :]
+    sin_matrix = sin_matrix[:, None, :, :]
+
+    q_rotate_half = torch.cat(
+        [
+            -q[:, :, :, q.size(-1) // 2:],
+            q[:, :, :, :q.size(-1) // 2]
+        ],
+        dim=-1
+    )
+
+    k_rotate_half = torch.cat(
+        [
+            -k[:, :, :, k.size(-1) // 2:],
+            k[:, :, :, :k.size(-1) // 2]
+        ],
+        dim=-1
+    )
+
+    q_out = q * cos_matrix + q_rotate_half * sin_matrix
+    k_out = k * cos_matrix + k_rotate_half * sin_matrix
+
+    return q_out.type_as(q), k_out.type_as(k)
+
+
 class RotaryPositionalEmbeddings(nn.Module):
 
     def __init__(self, config: dict) -> None:
@@ -451,27 +484,23 @@ class RotaryPositionalEmbeddings(nn.Module):
         self.register_buffer("cos_matrix", embedding.cos(), persistent=False)
         self.register_buffer("sin_matrix", embedding.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if config.use_liger:
+            self.apply_rotary_pos_emb = liger_rotary_pos_emb
+        else:
+            self.apply_rotary_pos_emb = apply_rotary_pos_emb
+
+    def forward(self, q: torch.Tensor, k:torch.Tensor, ) -> (torch.Tensor, torch.Tensor):
         seq_len: int
         cos_matrix: torch.Tensor
         sin_matrix: torch.Tensor
         x_rotate_half: torch.Tensor
         out: torch.Tensor
 
-        hidden_layer = x.float()
+        q_layer = q.float()
+        k_layer = k.float()
 
-        seq_len = x.shape[2]
+        seq_len = q_layer.size(2)
 
-        cos_matrix = self.cos_matrix[:, None, :seq_len, :]
-        sin_matrix = self.sin_matrix[:, None, :seq_len, :]
+        q_layer, k_layer = self.apply_rotary_pos_emb(q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len])
 
-        x_rotate_half = torch.cat(
-            [
-                -hidden_layer[:, :, :, x.size(-1) // 2:],
-                hidden_layer[:, :, :, :x.size(-1) // 2]
-            ],
-            dim=-1
-        )
-
-        out = hidden_layer * cos_matrix + x_rotate_half * sin_matrix
-        return out.type_as(x)
+        return q_layer.type_as(q), k_layer.type_as(k)

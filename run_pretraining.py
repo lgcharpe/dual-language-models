@@ -145,7 +145,7 @@ def setup_training(args, tokenizer):
 
     num_shards_per_gpu = args.num_shards // args.world_size
     args.shard_ranks = [i for i in range(args.rank * num_shards_per_gpu, (args.rank + 1) * num_shards_per_gpu)]
-    # args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
+    args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device("cuda", args.local_rank)
     print(f"RCCL started on device {args.device}", flush=True)
