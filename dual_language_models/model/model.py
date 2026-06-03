@@ -12,6 +12,16 @@ from liger_kernel.transformers import LigerRMSNorm, LigerCrossEntropyLoss, liger
 from liger_kernel.ops import LigerSiLUMulFunction
 
 
+@torch._dynamo.disable
+def _liger_rotary_pos_emb_eager(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_matrix: torch.Tensor,
+    sin_matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return liger_rotary_pos_emb(q, k, cos_matrix, sin_matrix)
+
+
 class ModelOutput:
 
     def __init__(
@@ -422,10 +432,12 @@ class FeedForward(nn.Module):
         return output
 
 
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos_matrix: torch.Tensor, sin_matrix: torch.Tensor) -> (torch.Tensor, torch.Tensor):
-    seq_len: int
-    cos_matrix: torch.Tensor
-    sin_matrix: torch.Tensor
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_matrix: torch.Tensor,
+    sin_matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     q_rotate_half: torch.Tensor
     k_rotate_half: torch.Tensor
     q_out: torch.Tensor
@@ -483,24 +495,23 @@ class RotaryPositionalEmbeddings(nn.Module):
         embedding = torch.cat([embedding, embedding], dim=-1).unsqueeze(0)
         self.register_buffer("cos_matrix", embedding.cos(), persistent=False)
         self.register_buffer("sin_matrix", embedding.sin(), persistent=False)
+        self.use_liger = bool(config.use_liger)
 
-        if config.use_liger:
-            self.apply_rotary_pos_emb = liger_rotary_pos_emb
-        else:
-            self.apply_rotary_pos_emb = apply_rotary_pos_emb
-
-    def forward(self, q: torch.Tensor, k:torch.Tensor, ) -> (torch.Tensor, torch.Tensor):
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len: int
-        cos_matrix: torch.Tensor
-        sin_matrix: torch.Tensor
-        x_rotate_half: torch.Tensor
-        out: torch.Tensor
 
         q_layer = q.float()
         k_layer = k.float()
 
         seq_len = q_layer.size(2)
 
-        q_layer, k_layer = self.apply_rotary_pos_emb(q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len])
+        if self.use_liger:
+            q_layer, k_layer = _liger_rotary_pos_emb_eager(
+                q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len]
+            )
+        else:
+            q_layer, k_layer = apply_rotary_pos_emb(
+                q_layer, k_layer, self.cos_matrix[:, :seq_len], self.sin_matrix[:, :seq_len]
+            )
 
         return q_layer.type_as(q), k_layer.type_as(k)
