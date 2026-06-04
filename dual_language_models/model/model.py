@@ -8,17 +8,8 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import math
 from functools import partial
 
-from liger_kernel.transformers import LigerCrossEntropyLoss
-
-
-def _document_masking(score, b, h, q_idx, kv_idx, doc_ids):
-    """Score mod for flex_attention that masks across document boundaries.
-
-    This is defined as a module-level function (not a closure) so that
-    torch.compile / Dynamo can trace it without graph breaks.
-    The doc_ids tensor is passed as an extra argument via functools.partial.
-    """
-    return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
+from liger_kernel.transformers import LigerCrossEntropyLoss, LigerRMSNorm
+from liger_kernel.ops import LigerSiLUMulFunction
 
 
 class ModelOutput:
@@ -246,7 +237,10 @@ class Classifier(nn.Module):
         self.emb2vocab: CastedLinear
         self.pre_norm: nn.RMSNorm
 
-        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
+        if config.use_liger:
+            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
+        else:
+            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
         self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
         self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=True)
 
@@ -299,7 +293,10 @@ class SelfAttention(nn.Module):
         self.qkv_proj = MultiCastedLinearOrtho(self.hidden_size, [self.hidden_size, self.hidden_size, self.hidden_size], bias=False)
         self.out_proj = CastedLinear(self.d_h*self.num_attention_heads, self.hidden_size, bias=False)
 
-        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
+        if config.use_liger:
+            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
+        else:
+            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
 
         self.rope_embedding = RotaryPositionalEmbeddings(config)
         self.scale: float = 1.0 / math.sqrt(self.d_h)
@@ -351,8 +348,9 @@ class SelfAttention(nn.Module):
 
         query, key = self.rope_embedding(query, key)
 
-        # Use functools.partial to pass doc_ids without a closure — Dynamo-friendly
-        score_mod = partial(_document_masking, doc_ids=doc_ids)
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
+
         output = flex_attention(query, key, value, block_mask=self.mask, score_mod=score_mod)
 
         output = output.permute(2, 0, 1, 3).flatten(2, 3)  # shape: [T, B, H*D]
@@ -371,9 +369,15 @@ class FeedForward(nn.Module):
         self.pre_norm: nn.RMSNorm
         self.activation: SwiGLU
 
-        self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
+        if config.use_liger:
+            self.pre_norm = LigerRMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
+        else:
+            self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
         self.up_proj = MultiCastedLinearOrtho(config.hidden_size, [config.intermediate_size, config.intermediate_size], bias=False)
-        self.activation = SwiGLU()
+        if config.use_liger:
+            self.activation = LigerSiLUMulFunction.apply
+        else:
+            self.activation = SwiGLU()
         self.down_proj = CastedLinear(config.intermediate_size, config.hidden_size, bias=False)
 
         self.initialize(config.hidden_size)
