@@ -19,7 +19,8 @@ import torch._dynamo
 
 from dual_language_models.model.model import Model
 from dual_language_models.optimizers.kimi_muon import Muon
-from dual_language_models.utils import trapezoid_schedule, MaskScheduler, is_main_process, seed_everything
+from dual_language_models.optimizers.normuon import NorMuonWithAuxAdam
+from dual_language_models.utils import trapezoid_schedule, MaskScheduler, is_main_process, seed_everything, cosine_schedule_with_warmup, cosine_schedule_with_warmup_cooldown, flat_with_warmup_schedule, trapezoid_schedule_sqrt
 from dual_language_models.pretraining.dataset import ValidationCausalDataset, ValidationMaskedDataset, FusedDatasetv2
 from dual_language_models.metrics import TrainingMetrics
 torch._dynamo.config.capture_scalar_outputs = True
@@ -75,12 +76,12 @@ def parse_arguments():
     parser.add_argument("--weight_decay", default=0.1, type=float, help="Weight decay if we apply some.")
     parser.add_argument("--optimizer_eps", default=1e-8, type=float, help="Optimizer epsilon.")
     parser.add_argument("--optimizer_beta1", default=0.9, type=float, help="Optimizer beta1.")
-    parser.add_argument("--optimizer_beta2", default=0.98, type=float, help="Optimizer beta2.")
+    parser.add_argument("--optimizer_beta2", default=0.95, type=float, help="Optimizer beta2.")
     parser.add_argument("--max_gradient", default=1e9, type=float, help="Max value for gradient clipping.")
     parser.add_argument('--n_special_tokens', default=16, type=int, help="Number of special tokens.")
     parser.add_argument('--z_loss_weight', default=0.0001, type=float, help="Weight for the z loss.")
     parser.add_argument("--experiment", default="dataset_size", type=str)
-    parser.add_argument("--optimizer", default="muon", type=str, choices=["muon", "adamw"])
+    parser.add_argument("--optimizer", default="muon", type=str, choices=["muon", "normuon", "adamw"])
     parser.add_argument("--untie", default=True, action="store_true")
     parser.add_argument("--momentum", default=0.95, type=float)
     parser.add_argument("--n_repetitions", default=64, type=int, help="Number of times to repeat the dataset.")
@@ -145,7 +146,7 @@ def setup_training(args, tokenizer):
 
     num_shards_per_gpu = args.num_shards // args.world_size
     args.shard_ranks = [i for i in range(args.rank * num_shards_per_gpu, (args.rank + 1) * num_shards_per_gpu)]
-    args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
+    # args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device("cuda", args.local_rank)
     print(f"RCCL started on device {args.device}", flush=True)
@@ -216,6 +217,11 @@ def prepare_model_and_optimizer(args):
     muon_parameters = [p for _, p in matrix_params]
     adamw_parameters = [p for _, p in other_params]
 
+    param_groups = [
+        {"params": muon_parameters, "use_muon": True, "lr": args.learning_rate, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95},
+        {"params": adamw_parameters, "use_muon": False, "lr": args.learning_rate, "weight_decay": args.weight_decay, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2)},
+    ]
+
     if is_main_process():
         print(f"Parameters with {args.optimizer} Optimizer:")
         for n, _ in matrix_params:
@@ -225,22 +231,58 @@ def prepare_model_and_optimizer(args):
             print(n)
         print(flush=True)
 
-    optimizer = Muon(
-        muon_params=muon_parameters,
-        lr=args.learning_rate,
-        wd=args.weight_decay,
-        momentum=args.momentum,
-        nesterov=True,
-        ns_steps=5,
-        adamw_params=adamw_parameters
-    )
+    if args.optimizer == "muon":
+        optimizer = Muon(
+            muon_params=muon_parameters,
+            lr=args.learning_rate,
+            wd=args.weight_decay,
+            momentum=args.momentum,
+            nesterov=True,
+            ns_steps=5,
+            adamw_params=adamw_parameters
+        )
+    elif args.optimizer == "normuon":
+        optimizer = NorMuonWithAuxAdam(
+            param_groups
+        )
 
-    lr_scheduler = trapezoid_schedule(
-        optimizer,
-        int(args.max_steps * args.warmup_proportion),
-        int(args.max_steps * args.cooldown_proportion),
-        args.max_steps
-    )
+
+    if args.scheduler == "trapezoid":
+        lr_scheduler = trapezoid_schedule(
+            optimizer,
+            int(args.max_steps * args.warmup_proportion),
+            int(args.max_steps * args.cooldown_proportion),
+            args.max_steps
+        )
+    elif args.scheduler == "trapezoid_sqrt":
+        lr_scheduler = trapezoid_schedule_sqrt(
+            optimizer,
+            int(args.max_steps * args.warmup_proportion),
+            int(args.max_steps * args.cooldown_proportion),
+            args.max_steps
+        )
+    elif args.scheduler == "cosine":
+        lr_scheduler = cosine_schedule_with_warmup(
+            optimizer,
+            int(args.max_steps * args.warmup_proportion),
+            args.max_steps,
+            min_factor=0.1
+        )
+    elif args.scheduler == "cosine_cooldown":
+        lr_scheduler = cosine_schedule_with_warmup_cooldown(
+            optimizer,
+            int(args.max_steps * args.warmup_proportion),
+            int(args.max_steps * args.cooldown_proportion),
+            args.max_steps,
+            min_factor=0.1
+        )
+    elif args.scheduler == "flat":
+        lr_scheduler = flat_with_warmup_schedule(
+            optimizer,
+            int(args.max_steps * args.warmup_proportion),
+            args.max_steps
+        )
+
     mask_scheduler = MaskScheduler(
         args.mask_p_min,
         args.mask_p_max,
