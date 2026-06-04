@@ -8,18 +8,6 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import math
 from functools import partial
 
-from liger_kernel.transformers import LigerCrossEntropyLoss
-
-
-def _document_masking(score, b, h, q_idx, kv_idx, doc_ids):
-    """Score mod for flex_attention that masks across document boundaries.
-
-    This is defined as a module-level function (not a closure) so that
-    torch.compile / Dynamo can trace it without graph breaks.
-    The doc_ids tensor is passed as an extra argument via functools.partial.
-    """
-    return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
-
 
 class ModelOutput:
 
@@ -106,10 +94,7 @@ class Model(nn.Module):
         self.embedding = Embedding(config)
         self.encoder = Encoder(config)
         self.classifier = Classifier(config, self.embedding.word_embedding.weight)
-        if config.use_liger:
-            self.loss_fn = LigerCrossEntropyLoss(reduction='none')
-        else:
-            self.loss_fn = partial(F.cross_entropy, reduction='none')
+        self.loss_fn = partial(F.cross_entropy, reduction='none')
 
     def change_model_type(self, model_type: str, device: torch.device):
         for layer in self.encoder.layers:
@@ -351,8 +336,9 @@ class SelfAttention(nn.Module):
 
         query, key = self.rope_embedding(query, key)
 
-        # Use functools.partial to pass doc_ids without a closure — Dynamo-friendly
-        score_mod = partial(_document_masking, doc_ids=doc_ids)
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
+
         output = flex_attention(query, key, value, block_mask=self.mask, score_mod=score_mod)
 
         output = output.permute(2, 0, 1, 3).flatten(2, 3)  # shape: [T, B, H*D]
