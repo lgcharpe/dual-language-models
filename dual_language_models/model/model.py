@@ -8,6 +8,11 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import math
 from functools import partial
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dual_language_models.config import ModelConfig
+
 
 class ModelOutput:
 
@@ -18,19 +23,15 @@ class ModelOutput:
         perplexity: torch.Tensor | float | None = None,
         accuracy: float | None = None,
         z_loss: torch.Tensor | float | None = None,
+        num_tokens: int | None = None,
         **kwargs
     ):
-        self.logits: torch.Tensor | None
-        self.loss: torch.Tensor | float | None
-        self.perplexity: torch.Tensor | float | None
-        self.accuracy: float | None
-        self.z_loss: torch.Tensor | float | None
-
         self.logits = logits
         self.loss = loss
         self.perplexity = perplexity
         self.accuracy = accuracy
         self.z_loss = z_loss
+        self.num_tokens = num_tokens
 
         for attr, value in kwargs.items():
             setattr(self, attr, value)
@@ -84,7 +85,7 @@ class SwiGLU(nn.Module):
 
 class Model(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
         self.embedding: Embedding
@@ -151,7 +152,7 @@ class Model(nn.Module):
 
 class Encoder(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
         self.layers: nn.ModuleList[Layer]
@@ -176,7 +177,7 @@ class Encoder(nn.Module):
 
 class Layer(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
         self.attention: SelfAttention
@@ -200,7 +201,7 @@ class Layer(nn.Module):
 
 class Embedding(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
         assert hasattr(config, "vocab_size"), "The config must have a vocab_size attribute!"
@@ -224,7 +225,7 @@ class Embedding(nn.Module):
 
 class Classifier(nn.Module):
 
-    def __init__(self, config: dict, embedding_weights: nn.Parameter) -> None:
+    def __init__(self, config: ModelConfig, embedding_weights: nn.Parameter) -> None:
         super().__init__()
 
         self.projection: CastedLinear
@@ -275,7 +276,7 @@ class Classifier(nn.Module):
 
 class SelfAttention(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.d_h = config.d_h
         self.num_attention_heads = config.num_attention_heads
@@ -289,7 +290,7 @@ class SelfAttention(nn.Module):
         self.rope_embedding = RotaryPositionalEmbeddings(config)
         self.scale: float = 1.0 / math.sqrt(self.d_h)
 
-        self.sequence_length = config.max_sequence_length
+        self.max_sequence_length = config.max_sequence_length
         self.is_causal = config.dataset_type == "causal"
 
         self.initialize()
@@ -306,12 +307,12 @@ class SelfAttention(nn.Module):
         if self.is_causal:
             self.mask = create_block_mask(
                 self.causal_mask_mode,
-                None, None, self.sequence_length, self.sequence_length, device=device
+                None, None, self.max_sequence_length, self.max_sequence_length, device=device
             )
         else:
             self.mask = create_block_mask(
                 self.bidirectional_mask_mode,
-                None, None, self.sequence_length, self.sequence_length, device=device
+                None, None, self.max_sequence_length, self.max_sequence_length, device=device
             )
 
     @torch.no_grad()
@@ -349,7 +350,7 @@ class SelfAttention(nn.Module):
 
 class FeedForward(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
         self.up_proj: CastedLinear
@@ -440,7 +441,7 @@ def apply_rotary_pos_emb(
 
 class RotaryPositionalEmbeddings(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
         assert hasattr(config, "d_h"), "The config must have a d_h attribute!"
