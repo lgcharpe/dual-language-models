@@ -1,0 +1,76 @@
+model:
+  model_name: Base
+  attention_pre_norm_affine: true
+  classifier_pre_norm_affine: true
+  feed_forward_pre_norm_affine: true
+  norm_eps: 1e-07
+  d_h: 64
+  hidden_size: 768
+  intermediate_size: 3072
+  num_attention_heads: 12
+  num_hidden_layers: 12
+  vocab_size: 128000
+  sequence_length: 2048
+  rope_theta: 10000
+  tie_weights: false
+  compile_model: true
+  tokenizer_path: /cluster/work/projects/nn30001k/nb-embed/dual-language-models/tokenizers/tokenizer_aurora.json
+  n_special_tokens: 16
+
+data:
+  train_path: /cluster/work/projects/nn30001k/nb-embed/dual-language-models/data/aurora-open/train_tokens
+  valid_path: /cluster/work/projects/nn30001k/nb-embed/dual-language-models/data/aurora-open/valid_tokens
+  num_shards: 128
+  num_train_tokens: 5e10
+
+training:
+  seed: 42
+  load_checkpoint: false
+  checkpoint_path:
+  hybrid_numerator: 1
+  hybrid_denominator: 4
+  z_loss_weight: 0.0001
+  max_steps:
+  number_of_tokens: 3e11
+  local_batch_size: 16
+  global_batch_size: 2048
+  adam_learning_rate: 1e-4
+  muon_learning_rate: 1e-2
+  scheduler: flat
+  warmup: 5000
+  cooldown: 20000
+  adam_weight_decay: 0.0
+  muon_weight_decay: 0.1
+  max_gradient: 1.0
+  mask_p_max: 0.3
+  mask_p_min: 0.1
+  mask_random_p: 0.1
+  mask_keep_p: 0.1
+  optimizer: normuon
+  adam_eps: 1e-8
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  momentum: 0.95
+  muon_beta2: 0.95
+
+
+checkpointing:
+  output_dir:
+  save_every:
+  checkpoint_style:
+  first_checkpoint:
+  checkpoint_mult:
+  checkpoint_on:
+  checkpoint_init:
+  checkpoint_before_cooldown:
+
+
+logging:
+  run_name: "test_run"
+  wandb_log: false
+  wandb_project:
+  wandb_entity:
+  validate_every: 100
+  validation_steps: 1
+  experiment: "test"
+
