@@ -2,7 +2,6 @@ from __future__ import annotations
 import torch
 import numpy as np
 from typing import TYPE_CHECKING, Literal
-import random
 
 if TYPE_CHECKING:
     from tokenizers import Tokenizer
@@ -25,22 +24,19 @@ class ValidationDataset:
         self.orders = []
         self.lens = []
         self.seed = args.seed
-        self.documents = []
         for rank in ranks:
             documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
-            self.documents.extend(documents)
             print(f"Dataset {dataset}/{rank:d}.bin loaded", flush=True)
-        # documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
-        for i, document in enumerate(documents):
-            # if i % args.document_skip != 0:
-            #     continue
+            for i, document in enumerate(documents):
+                # if i % args.document_skip != 0:
+                #     continue
 
-            document = torch.cat([torch.LongTensor([self.cls_index]), document])
-            self.doc_segments += [
-                document[offset : offset + self.max_seq_length]
-                for offset in range(0, len(document), self.max_seq_length)
-                if len(document) > 0 and len(document) - offset > 1
-            ]
+                document = torch.cat([torch.LongTensor([self.cls_index]), document])
+                self.doc_segments += [
+                    document[offset : offset + self.max_seq_length]
+                    for offset in range(0, len(document), self.max_seq_length)
+                    if len(document) > 0 and len(document) - offset > 1
+                ]
         self.len = len(self.doc_segments)
         self.current_idx = 0
 
@@ -133,8 +129,8 @@ class ValidationCausalDataset(ValidationDataset):
 
 class ValidationMaskedDataset(ValidationDataset):
 
-    def __init__(self, dataset: str, tokenizer, args, seq_length, rank):
-        super().__init__(dataset, tokenizer, args, seq_length, rank)
+    def __init__(self, dataset: str, tokenizer, args, seq_length, ranks):
+        super().__init__(dataset, tokenizer, args, seq_length, ranks)
 
         self.masking_strategy = SpanMaskingStrategy(args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index)
 
@@ -263,7 +259,6 @@ class TrainDataset:
         self.order = np.arange(len(self.tensors) // self.seq_length)
         if self.shuffle:
             self._reshuffle()
-        print(f"Order of sequences is initialized to {self.order}", flush=True)
 
         print(f"TrainDataset initialized with {len(self.order)} sequences", flush=True)
 
@@ -418,7 +413,8 @@ class TrainDataset:
     def load_state_from_num_sequences_seen(self: TrainDataset, num_sequences_seen: int) -> None:
         self.iterations = num_sequences_seen // self.num_sequences
         self.current_idx = num_sequences_seen % self.num_sequences
-        self._reshuffle()
+        if self.shuffle:
+            self._reshuffle()
 
     def get_state(self: TrainDataset) -> dict[str, int]:
         return {
