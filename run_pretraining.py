@@ -6,6 +6,7 @@ from tqdm import tqdm
 from socket import gethostname
 import json
 import math
+import time
 from pathlib import Path
 from contextlib import nullcontext
 import datetime
@@ -25,6 +26,7 @@ from dual_language_models.pretraining.dataset import ValidationCausalDataset, Va
 from dual_language_models.metrics import TrainingMetrics
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.guard_nn_modules = False  # Prevent recompilation when self.mask changes
 
 
 # if int(os.environ["SLURM_PROCID"]) == 0:
@@ -86,6 +88,8 @@ def parse_arguments():
     parser.add_argument("--momentum", default=0.95, type=float)
     parser.add_argument("--n_repetitions", default=64, type=int, help="Number of times to repeat the dataset.")
     parser.add_argument("--num_shards", default=128, type=int, help="Number of data shards (per dataset type). Should be at least the number of GPUs.")
+    parser.add_argument("--debug", action="store_true", help="Whether to run in debug mode (runs on a single GPU with a small subset of the data).")
+    parser.add_argument("--log_mode_switch", action="store_true", help="Log per-rank objective switch timing information.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -133,22 +137,24 @@ def setup_training(args, tokenizer):
     print(f"Dataset type: {args.dataset_type}", flush=True)
 
     # args.local_rank = args.rank % args.gpus_per_node
+    torch.cuda.set_device(args.local_rank)
+    args.device = torch.device("cuda", args.local_rank)
 
     dist.init_process_group(
         backend="nccl",
         init_method='env://',
         rank=args.rank,
         world_size=args.world_size,
-        timeout=datetime.timedelta(minutes=10)
+        timeout=datetime.timedelta(minutes=10),
+        device_id=args.device,
     )
 
     seed_everything(args.seed + args.rank)
 
     num_shards_per_gpu = args.num_shards // args.world_size
     args.shard_ranks = [i for i in range(args.rank * num_shards_per_gpu, (args.rank + 1) * num_shards_per_gpu)]
-    # args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
-    torch.cuda.set_device(args.local_rank)
-    args.device = torch.device("cuda", args.local_rank)
+    if args.debug:
+        args.shard_ranks = [args.shard_ranks[0]]  # Debugging OOM errors, remove this line for full dataset
     print(f"RCCL started on device {args.device}", flush=True)
     print(f"host: {gethostname()}, rank: {args.rank}, local_rank: {args.local_rank}")
 
@@ -197,6 +203,31 @@ def prepare_model_and_optimizer(args):
 
     model = torch.compile(model)
 
+    # # Pre-warm both compiled code paths (causal + masked) BEFORE DDP wrapping
+    # # so torch.compile traces both graphs without any DDP state involvement.
+    # print(f"[rank {args.rank}] Pre-warming compiled graphs for both modes...", flush=True)
+    # dummy_ids = torch.zeros(args.max_seq_length, args.local_batch_size, dtype=torch.long, device=args.device)
+    # dummy_doc = torch.zeros(args.local_batch_size, args.max_seq_length, dtype=torch.int, device=args.device)
+    # dummy_labels = torch.full((args.max_seq_length, args.local_batch_size), -100, dtype=torch.long, device=args.device)
+    # # Warm current mode
+    # output = model(dummy_ids, dummy_doc, dummy_labels)
+    # if output.loss is not None:
+    #     output.loss.sum().backward()
+    # model.zero_grad(set_to_none=True)
+    # # Warm other mode
+    # other_mode = "causal" if args.dataset_type == "masked" else "masked"
+    # model.change_model_type(other_mode, args.device)
+    # output = model(dummy_ids, dummy_doc, dummy_labels)
+    # if output.loss is not None:
+    #     output.loss.sum().backward()
+    # model.zero_grad(set_to_none=True)
+    # # Switch back to original mode
+    # model.change_model_type("causal" if args.dataset_type == "causal" else "masked", args.device)
+    # del dummy_ids, dummy_doc, dummy_labels, output
+    # torch.cuda.empty_cache()
+    # dist.barrier()
+    # print(f"[rank {args.rank}] Graph warmup complete.", flush=True)
+
     ddp_model = DDP(
         model,
         device_ids=[args.local_rank],
@@ -219,7 +250,7 @@ def prepare_model_and_optimizer(args):
 
     param_groups = [
         {"params": muon_parameters, "use_muon": True, "lr": args.learning_rate, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95},
-        {"params": adamw_parameters, "use_muon": False, "lr": args.learning_rate, "weight_decay": args.weight_decay, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2)},
+        {"params": adamw_parameters, "use_muon": False, "lr": args.learning_rate, "weight_decay": 0.0, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2)},
     ]
 
     if is_main_process():
@@ -379,9 +410,18 @@ def training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, vali
         else:
             dataset_type = "causal"
         if dataset_type != args.dataset_type:
+            previous_dataset_type = args.dataset_type
+            switch_start = time.perf_counter()
             args.dataset_type = dataset_type
             train_dataset.set_mode("diffusion" if args.dataset_type == "masked" else "causal")
             model.change_model_type(dataset_type, args.device)
+            if args.log_mode_switch:
+                switch_ms = (time.perf_counter() - switch_start) * 1000.0
+                print(
+                    f"[rank {args.rank}] mode switch {previous_dataset_type}->{dataset_type} "
+                    f"at global_step={global_step}, epoch={epoch}, took {switch_ms:.2f} ms",
+                    flush=True,
+                )
 
         next_batch = get_batch(args, train_dataset, global_step)
 
@@ -658,6 +698,12 @@ if __name__ == "__main__":
     setup_training(args, tokenizer)
     model, ddp_model, optimizer, lr_scheduler, mask_scheduler, global_step = prepare_model_and_optimizer(args)
     train_dataset, valid_diffusion_dataset, valid_causal_dataset = load_train_dataset(args, tokenizer)
+
+    local_len = torch.tensor(len(train_dataset), device=args.device)
+    dist.all_reduce(local_len, op=dist.ReduceOp.MIN)
+    train_dataset.set_max_sequences(local_len.item())
+    if is_main_process():
+        print(f"Dataset length synchronized to {local_len.item()} sequences across all ranks", flush=True)
 
     training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, valid_causal_dataset, optimizer, lr_scheduler, mask_scheduler, global_step, args)
 

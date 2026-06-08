@@ -98,8 +98,7 @@ class Model(nn.Module):
 
     def change_model_type(self, model_type: str, device: torch.device):
         for layer in self.encoder.layers:
-            layer.attention.is_causal = model_type == "causal"
-        self.encoder._create_mask(device)
+            layer.attention.set_mode(model_type)
 
     def create_mask(self, device: torch.device):
         self.encoder._create_mask(device)
@@ -291,6 +290,9 @@ class SelfAttention(nn.Module):
 
         self.sequence_length = config.max_sequence_length
         self.is_causal = config.dataset_type == "causal"
+        self.causal_mask = None
+        self.bidirectional_mask = None
+        self.mask = None
 
         self.initialize()
 
@@ -303,16 +305,23 @@ class SelfAttention(nn.Module):
         return torch.ones_like(q_idx, dtype=torch.bool)
 
     def _create_block_mask(self, device: torch.device) -> None:
-        if self.is_causal:
-            self.mask = create_block_mask(
+        if self.causal_mask is None:
+            self.causal_mask = create_block_mask(
                 self.causal_mask_mode,
                 None, None, self.sequence_length, self.sequence_length, device=device
             )
-        else:
-            self.mask = create_block_mask(
+        if self.bidirectional_mask is None:
+            self.bidirectional_mask = create_block_mask(
                 self.bidirectional_mask_mode,
                 None, None, self.sequence_length, self.sequence_length, device=device
             )
+        self.mask = self.causal_mask if self.is_causal else self.bidirectional_mask
+
+    def set_mode(self, model_type: str) -> None:
+        self.is_causal = model_type == "causal"
+        if self.causal_mask is None or self.bidirectional_mask is None:
+            raise RuntimeError("Attention masks are not initialized. Call create_mask() before switching mode.")
+        self.mask = self.causal_mask if self.is_causal else self.bidirectional_mask
 
     @torch.no_grad()
     def initialize(self) -> None:

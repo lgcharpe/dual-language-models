@@ -81,7 +81,20 @@ class Datasetv2:
             output_chunks = [output_chunks[i] for i in indices]
             document_id_chunks = [document_id_chunks[i] for i in indices]
 
+        # Truncate to synchronized length so all ranks rechunk at the same step
+        if hasattr(self, '_max_sequences') and len(input_chunks) > self._max_sequences:
+            input_chunks = input_chunks[:self._max_sequences]
+            output_chunks = output_chunks[:self._max_sequences]
+            document_id_chunks = document_id_chunks[:self._max_sequences]
+
         return input_chunks, output_chunks, document_id_chunks
+    
+    def set_max_sequences(self, max_sequences: int) -> None:
+        """Truncate to a fixed number of sequences so all ranks rechunk at the same step."""
+        self._max_sequences = max_sequences
+        self.inputs = self.inputs[:max_sequences]
+        self.outputs = self.outputs[:max_sequences]
+        self.doc_ids = self.doc_ids[:max_sequences]
 
     def load_state(self: Datasetv2, dataset_state: dict[str, int]) -> None:
         self.current_idx = dataset_state["current_idx"]
