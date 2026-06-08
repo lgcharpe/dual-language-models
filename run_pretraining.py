@@ -134,7 +134,13 @@ def setup_training(args, tokenizer):
         args.dataset_type = "masked"
     else:
         args.dataset_type = "causal"
-    print(f"Dataset type: {args.dataset_type}", flush=True)
+    print(f"[rank {args.rank}] Dataset type: {args.dataset_type}", flush=True)
+
+    if args.rank < (args.world_size // 2):
+        args.valid_mask_mode = "masked"
+    else:
+        args.valid_mask_mode = "causal"
+    print(f"[rank {args.rank}] Validation dataset type: {args.valid_mask_mode}", flush=True)
 
     # args.local_rank = args.rank % args.gpus_per_node
     torch.cuda.set_device(args.local_rank)
@@ -202,31 +208,6 @@ def prepare_model_and_optimizer(args):
     model.create_mask(args.device)
 
     model = torch.compile(model)
-
-    # # Pre-warm both compiled code paths (causal + masked) BEFORE DDP wrapping
-    # # so torch.compile traces both graphs without any DDP state involvement.
-    # print(f"[rank {args.rank}] Pre-warming compiled graphs for both modes...", flush=True)
-    # dummy_ids = torch.zeros(args.max_seq_length, args.local_batch_size, dtype=torch.long, device=args.device)
-    # dummy_doc = torch.zeros(args.local_batch_size, args.max_seq_length, dtype=torch.int, device=args.device)
-    # dummy_labels = torch.full((args.max_seq_length, args.local_batch_size), -100, dtype=torch.long, device=args.device)
-    # # Warm current mode
-    # output = model(dummy_ids, dummy_doc, dummy_labels)
-    # if output.loss is not None:
-    #     output.loss.sum().backward()
-    # model.zero_grad(set_to_none=True)
-    # # Warm other mode
-    # other_mode = "causal" if args.dataset_type == "masked" else "masked"
-    # model.change_model_type(other_mode, args.device)
-    # output = model(dummy_ids, dummy_doc, dummy_labels)
-    # if output.loss is not None:
-    #     output.loss.sum().backward()
-    # model.zero_grad(set_to_none=True)
-    # # Switch back to original mode
-    # model.change_model_type("causal" if args.dataset_type == "causal" else "masked", args.device)
-    # del dummy_ids, dummy_doc, dummy_labels, output
-    # torch.cuda.empty_cache()
-    # dist.barrier()
-    # print(f"[rank {args.rank}] Graph warmup complete.", flush=True)
 
     ddp_model = DDP(
         model,
@@ -561,7 +542,12 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
     local_step = 0
     valid_steps = 0
 
-    valid_dataset = valid_diffusion_dataset if args.dataset_type == "masked" else valid_causal_dataset
+    switch_start = time.perf_counter()
+    model.change_model_type(args.valid_mask_mode, args.device)
+    switch_end = time.perf_counter()
+    print(f"[rank {args.rank}] Switched model type to {args.valid_mask_mode} in {switch_end - switch_start:.2f} seconds", flush=True)
+
+    valid_dataset = valid_diffusion_dataset if args.valid_mask_mode == "masked" else valid_causal_dataset
 
     for batch in valid_dataset.iterate_over_all(args.max_seq_length, args.local_batch_size):
         input_ids, target_ids, doc_ids, mask_p = [t.cuda(non_blocking=True) for t in batch]
@@ -632,6 +618,11 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
 
         if valid_steps == args.validation_steps:
             break
+    
+    switch_start = time.perf_counter()
+    model.change_model_type(args.dataset_type, args.device)
+    switch_end = time.perf_counter()
+    print(f"[rank {args.rank}] Switched model type to {args.dataset_type} in {switch_end - switch_start:.2f} seconds", flush=True)
 
 
 def save(model, optimizer, lr_scheduler, mask_scheduler, global_step, train_dataset, args):
