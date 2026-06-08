@@ -674,7 +674,7 @@ def load_train_dataset(args, tokenizer, global_step=0):
 
     train_dataset = TrainDataset(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, args.seed, shuffle=True)
     if global_step > 0:
-        num_sequences_seen = global_step * (args.global_batch_size / args.world_size)
+        num_sequences_seen = global_step * (args.global_batch_size // args.world_size)
         train_dataset.load_state_from_num_sequences_seen(num_sequences_seen)
 
     # train_diffusion_dataset = DiffusionDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
