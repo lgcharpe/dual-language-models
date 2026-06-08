@@ -351,7 +351,7 @@ def prepare_model_and_optimizer(args):
 
 @torch.no_grad()
 def get_batch(args, dataset, global_step):
-    batch = dataset.next(args.max_seq_length, args.local_batch_size)
+    batch = dataset.next(args.local_batch_size)
     input_ids, target_ids, doc_ids, mask_p = [t.cuda(non_blocking=True) for t in batch]
     input_ids, target_ids, mask_p = input_ids.t(), target_ids.t(), mask_p.t()
 
@@ -701,12 +701,6 @@ if __name__ == "__main__":
     setup_training(args, tokenizer)
     model, ddp_model, optimizer, lr_scheduler, mask_scheduler, global_step = prepare_model_and_optimizer(args)
     train_dataset, valid_diffusion_dataset, valid_causal_dataset = load_train_dataset(args, tokenizer, global_step)
-
-    local_len = torch.tensor(len(train_dataset), device=args.device)
-    dist.all_reduce(local_len, op=dist.ReduceOp.MIN)
-    train_dataset.set_max_sequences(local_len.item())
-    if is_main_process():
-        print(f"Dataset length synchronized to {local_len.item()} sequences across all ranks", flush=True)
 
     training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, valid_causal_dataset, optimizer, lr_scheduler, mask_scheduler, global_step, args)
 
