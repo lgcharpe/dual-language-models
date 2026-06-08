@@ -84,6 +84,7 @@ def parse_arguments():
     parser.add_argument('--z_loss_weight', default=0.0001, type=float, help="Weight for the z loss.")
     parser.add_argument("--experiment", default="dataset_size", type=str)
     parser.add_argument("--optimizer", default="muon", type=str, choices=["muon", "normuon", "adamw"])
+    parser.add_argument("--polar_express", action="store_true", help="Whether to use the Polar Express approximation in the NorMuon optimizer.")
     parser.add_argument("--untie", default=True, action="store_true")
     parser.add_argument("--momentum", default=0.95, type=float)
     parser.add_argument("--n_repetitions", default=64, type=int, help="Number of times to repeat the dataset.")
@@ -255,7 +256,8 @@ def prepare_model_and_optimizer(args):
         )
     elif args.optimizer == "normuon":
         optimizer = NorMuonWithAuxAdam(
-            param_groups
+            param_groups,
+            polar_express=args.polar_express
         )
 
 
@@ -639,10 +641,6 @@ def save(model, optimizer, lr_scheduler, mask_scheduler, global_step, train_data
             },
             path_to_save_folder / "state_dict.bin"
         )
-        # torch.save(
-        #     train_dataset.get_state(),
-        #     path_to_save_folder / f"dataset_info_{args.dataset_type}_{args.shard_rank}.bin"
-        # )
 
 
 def save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step, tokens_trained, train_dataset, args):
@@ -662,10 +660,6 @@ def save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step,
             },
             path_to_save_folder / "state_dict.bin"
         )
-        # torch.save(
-        #     train_dataset.get_state(),
-        #     path_to_save_folder / f"dataset_info_{args.dataset_type}_{args.shard_rank}.bin"
-        # )
 
 
 def load_train_dataset(args, tokenizer, global_step=0):

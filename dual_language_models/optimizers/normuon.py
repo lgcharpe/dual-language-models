@@ -2,6 +2,7 @@
 
 import torch
 import torch.distributed as dist
+from dual_language_models.optimizers.polar_express import PolarExpress
 
 # copied from https://github.com/KellerJordan/Muon/blob/master/muon.py
 def zeropower_via_newtonschulz5(G, steps=5):
@@ -34,14 +35,17 @@ def zeropower_via_newtonschulz5(G, steps=5):
 
 
 
-def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
+def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True, polar_express=False):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     original_shape = None
     if update.ndim == 4:  # for the case of conv filters
         original_shape = update.shape
         update = update.reshape(update.size(0), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    if polar_express:
+        update = PolarExpress(update, steps=ns_steps)
+    else:
+        update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     update = update.to(grad.dtype)
 
     if original_shape is not None:
@@ -145,7 +149,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
     Distributed NorMuon variant paired with an auxiliary Adam optimizer for parameters that are not
     compatible with NorMuon. Groups intended for NorMuon should set `use_muon=True`.
     """
-    def __init__(self, param_groups):
+    def __init__(self, param_groups, polar_express: bool = False):
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -162,6 +166,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0)
                 assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
         super().__init__(param_groups, dict())
+        self.polar_express = polar_express
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -186,7 +191,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                             state["momentum_buffer"] = torch.zeros_like(p)
                             state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                         update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
-                                                beta=group["momentum"], beta2=group["beta2"])
+                                                beta=group["momentum"], beta2=group["beta2"], polar_express=self.polar_express)
                         if group["weight_decay"] and had_grad:
                             p.mul_(1 - group["lr"] * group["weight_decay"])
                         p.add_(update.reshape(p.shape), alpha=-group["lr"])
