@@ -13,6 +13,15 @@ def parse_arguments():
     parser.add_argument("--valid_path", type=Path, help="Path to the validation dataset.")
     parser.add_argument("--num_shards", type=int, help="Number of data shards (per dataset type). Should be at least the number of GPUs.")
     parser.add_argument("--dataset_type", type=str, help="The type of dataset to train on (causal or masked). This will be set automatically in distributed training based on the hybrid training parameters, but can be set manually for non-distributed training.")
+    parser.add_argument("--num_train_tokens", type=int, help="Total number of tokens to train on. This is used to calculate the number of training steps and for learning rate scheduling.")
+    ## Masking parameters
+    parser.add_argument("--mask_p_max", type=float, help="Masking asking probability.")
+    parser.add_argument("--mask_p_min", type=float, help="Minimum masking probability.")
+    parser.add_argument("--mask_random_p", type=float, help="Probability of replacing the masked token with a random token.")
+    parser.add_argument("--mask_keep_p", type=float, help="Probability of keeping the masked token.")
+    ## Tokenizer parameters
+    parser.add_argument("--tokenizer_path", type=Path, help="Path to the tokenizer.")
+    parser.add_argument('--n_special_tokens', type=int, help="Number of special tokens.")
 
     # Training parameters
     ## Seeding and reproducibility parameters
@@ -41,11 +50,6 @@ def parse_arguments():
     parser.add_argument("--muon_weight_decay", type=float, help="Weight decay if we apply some.")
     ## Gradient Clipping
     parser.add_argument("--max_gradient", type=float, help="Max value for gradient clipping.")
-    ## Masking parameters
-    parser.add_argument("--mask_p_max", type=float, help="Masking asking probability.")
-    parser.add_argument("--mask_p_min", type=float, help="Minimum masking probability.")
-    parser.add_argument("--mask_random_p", type=float, help="Probability of replacing the masked token with a random token.")
-    parser.add_argument("--mask_keep_p", type=float, help="Probability of keeping the masked token.")
     ## Optimizer parameters
     parser.add_argument("--optimizer", type=str, choices=["muon", "normuon", "adamw"])
     parser.add_argument("--adam_eps", type=float, help="Adam epsilon.")
@@ -91,9 +95,6 @@ def parse_arguments():
     parser.add_argument("--max_sequence_length", type=int, help="Maximum sequence length for training.")
     ## Model optimization parameters
     parser.add_argument("--compile_model", action="store_true", help="Whether to compile the model with torch.compile for faster training.")
-    ## Tokenizer parameters
-    parser.add_argument("--tokenizer_path", type=Path, help="Path to the tokenizer.")
-    parser.add_argument('--n_special_tokens', type=int, help="Number of special tokens.")
 
 
     args = parser.parse_args()

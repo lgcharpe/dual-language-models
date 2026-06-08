@@ -17,8 +17,8 @@ model:
   compile_model: false
 
 data:
-  train_path: data/toy_train
-  valid_path: data/toy_valid
+  train_path: data/train_tokens
+  valid_path: data/valid_tokens
   num_shards: 1
   num_train_tokens: 1.e+8
   dataset_type: causal

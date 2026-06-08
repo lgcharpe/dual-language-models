@@ -21,19 +21,15 @@ class ModelConfig:
     hidden_size: int = 192
     num_attention_heads: int = 3
     intermediate_size: int = 768
-    num_layers: int = 12
+    num_layers: int = 6
     vocab_size: int = 51200
-    max_sequence_length: int = 2048
+    max_sequence_length: int = 512
     rope_theta: float = 10000.0
     tie_weights: bool = False
     dataset_type: str = "causal"  # "masked" or "causal", will be set in distributed setup based on hybrid training parameters
 
     # Model optimization parameters
     compile_model: bool = True
-
-    # Tokenizer parameters
-    tokenizer_path: Path = Path("tokenizers/tokenizer.json")
-    n_special_tokens: int = 16
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> ModelConfig:
@@ -49,23 +45,40 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    train_data_path: Path = Path("data/train")
-    val_data_path: Path = Path("data/val")
+    train_path: Path = Path("data/train")
+    valid_path: Path = Path("data/val")
     num_shards: int = 1
     num_train_tokens: Optional[int] = 100_000_000
     shard_ranks: Optional[list[int]] = None
     dataset_type: str = "causal"
+    max_sequence_length: int = 2048
+
+    # Masking parameters
+    mask_p_max: float = 0.3
+    mask_p_min: float = 0.1
+    mask_random_p: float = 0.1
+    mask_keep_p: float = 0.1
+
+    # Tokenizer parameters
+    tokenizer_path: Path = Path("tokenizers/tokenizer.json")
+    n_special_tokens: int = 16
+    vocab_size: Optional[int] = None  # Will be retrieved from the model vocab size if not provided here
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> DataConfig:
         existing_keys = {f.name for f in fields(cls)}
         filtered_dict = {k: v for k, v in config_dict.items() if k in existing_keys}
         return cls(**filtered_dict)
-
+    
+    def make_str_paths(self) -> None:
+        self.train_path = Path(str(self.train_path))
+        self.valid_path = Path(str(self.valid_path))
+        self.tokenizer_path = Path(str(self.tokenizer_path))
     def update(self, **kwargs) -> None:
         for key, value in kwargs.items():
             if hasattr(self, key) and value is not None:
                 setattr(self, key, value)
+        self.make_str_paths()
 
 
 @dataclass
@@ -78,7 +91,7 @@ class TrainingConfig:
 
     # Loss parameters
     hybrid_numerator: int = 1
-    hybrid_denominator: int = 2
+    hybrid_denominator: int = 1
     z_loss_weight: float = 0.0001
 
     # Training duration parameters
@@ -86,11 +99,15 @@ class TrainingConfig:
     number_of_tokens: Optional[int] = None
     epochs: Optional[float] = None
     tokens_per_step: Optional[int] = None
+    steps_per_epoch: Optional[int] = None
 
     # Batch Size
     local_batch_size: int = 16
-    global_batch_size: int = 128
+    global_batch_size: int = 64
     accumulate_steps: int = 1
+
+    # Masking parameters
+    mask_p: Optional[float] = None
 
     # Learning Rate
     adam_learning_rate: float = 1e-4
@@ -105,12 +122,6 @@ class TrainingConfig:
 
     # Gradient Clipping
     max_gradient: float = 1.0
-
-    # Masking parameters
-    mask_p_max: float = 0.3
-    mask_p_min: float = 0.1
-    mask_random_p: float = 0.1
-    mask_keep_p: float = 0.1
 
     # Optimizer parameters
     optimizer: str = "muon"
@@ -153,17 +164,21 @@ class CheckpointConfig:
         filtered_dict = {k: v for k, v in config_dict.items() if k in existing_keys}
         return cls(**filtered_dict)
 
+    def make_str_paths(self) -> None:
+        self.output_dir = Path(str(self.output_dir))
+
     def update(self, **kwargs) -> None:
         for key, value in kwargs.items():
             if hasattr(self, key) and value is not None:
                 setattr(self, key, value)
+        self.make_str_paths()
 
 
 @dataclass
 class LoggingConfig:
     # Run parameters
-    run_name: str = "test_run"  # Becomes run name in WandB and part of the checkpoint path
-    experiment: str = "test"  # Becomes WandB group name
+    run_name: str = "default_run"  # Becomes run name in WandB and part of the checkpoint path
+    experiment: str = "default"  # Becomes WandB group name
 
     # WandB logging parameters
     wandb_log: bool = False
@@ -214,10 +229,14 @@ class Config:
         config_dict = yaml.safe_load(config_path.open("r"))
         model_params = ModelConfig.from_dict(config_dict.get("model", {}))
         data_params = DataConfig.from_dict(config_dict.get("data", {}))
+        data_params.make_str_paths()
         training_params = TrainingConfig.from_dict(config_dict.get("training", {}))
         logging_params = LoggingConfig.from_dict(config_dict.get("logging", {}))
         checkpoint_params = CheckpointConfig.from_dict(config_dict.get("checkpointing", {}))
+        checkpoint_params.make_str_paths()
         distributed_params = DistributedConfig.from_dict(config_dict.get("distributed", {}))
+        if data_params.vocab_size is None:
+            data_params.vocab_size = model_params.vocab_size
         return cls(
             model_params=model_params,
             data_params=data_params,
@@ -254,9 +273,13 @@ class Config:
         # Calculate epochs if not provided
         if self.training_params.epochs is None:
             if self.data_params.num_train_tokens is not None:
-                self.training_params.epochs = self.training_params.number_of_tokens / self.data_params.num_train_tokens
+                self.training_params.epochs = float(self.training_params.number_of_tokens) / self.data_params.num_train_tokens
             else:
                 self.training_params.epochs = 1
+        self.training_params.epochs = max(1, self.training_params.epochs)
+
+        if self.training_params.steps_per_epoch is None:
+            self.training_params.steps_per_epoch = math.ceil(self.training_params.max_steps / self.training_params.epochs)
         
         # Calculate number of training tokens if not provided
         if self.training_params.number_of_tokens is None:

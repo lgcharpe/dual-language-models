@@ -99,11 +99,11 @@ class Model(nn.Module):
 
     def change_model_type(self, model_type: str, device: torch.device):
         for layer in self.encoder.layers:
-            layer.attention.is_causal = model_type == "causal"
-        self.encoder._create_mask(device)
+            layer.attention.set_mode(model_type, device)
 
     def create_mask(self, device: torch.device):
-        self.encoder._create_mask(device)
+        for layer in self.encoder.layers:
+            layer.attention.create_masks(device)
 
     def get_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         word_embeddings: torch.Tensor
@@ -164,10 +164,6 @@ class Encoder(nn.Module):
                 weight.data *= math.sqrt(1.0 / (2.0 * (i + 1)))
             layer.mlp.down_proj.weight.data *= math.sqrt(1.0 / (2.0 * (i + 1)))
 
-    def _create_mask(self, device: torch.device) -> None:
-        for layer in self.layers:
-            layer._create_mask(device)
-
     def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
             hidden_layer = layer(hidden_layer, doc_ids)
@@ -185,9 +181,6 @@ class Layer(nn.Module):
 
         self.attention = SelfAttention(config)
         self.mlp = FeedForward(config)
-
-    def _create_mask(self, device: torch.device) -> None:
-        self.attention._create_block_mask(device)
 
     def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
         output: torch.Tensor
@@ -292,28 +285,34 @@ class SelfAttention(nn.Module):
 
         self.max_sequence_length = config.max_sequence_length
         self.is_causal = config.dataset_type == "causal"
+        self.mask = None
+        self._causal_mask = None
+        self._bidirectional_mask = None
 
         self.initialize()
 
+    def create_masks(self, device: torch.device):
+        self._causal_mask = create_block_mask(
+            self._causal_mask_fn, None, None,
+            self.max_sequence_length, self.max_sequence_length, device=device
+        )
+        self._bidirectional_mask = create_block_mask(
+            self._bidirectional_mask_fn, None, None,
+            self.max_sequence_length, self.max_sequence_length, device=device
+        )
+        self.mask = self._causal_mask if self.is_causal else self._bidirectional_mask
+
+    def set_mode(self, model_type: str, device: torch.device):
+        self.is_causal = model_type == "causal"
+        self.mask = self._causal_mask if self.is_causal else self._bidirectional_mask
+
     @staticmethod
-    def causal_mask_mode(b, h, q_idx, kv_idx):
+    def _causal_mask_fn(b, h, q_idx, kv_idx):
         return (q_idx >= kv_idx)
 
     @staticmethod
-    def bidirectional_mask_mode(b, h, q_idx, kv_idx):
+    def _bidirectional_mask_fn(b, h, q_idx, kv_idx):
         return torch.ones_like(q_idx, dtype=torch.bool)
-
-    def _create_block_mask(self, device: torch.device) -> None:
-        if self.is_causal:
-            self.mask = create_block_mask(
-                self.causal_mask_mode,
-                None, None, self.max_sequence_length, self.max_sequence_length, device=device
-            )
-        else:
-            self.mask = create_block_mask(
-                self.bidirectional_mask_mode,
-                None, None, self.max_sequence_length, self.max_sequence_length, device=device
-            )
 
     @torch.no_grad()
     def initialize(self) -> None:

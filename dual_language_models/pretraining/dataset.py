@@ -81,7 +81,20 @@ class Datasetv2:
             output_chunks = [output_chunks[i] for i in indices]
             document_id_chunks = [document_id_chunks[i] for i in indices]
 
+        # Truncate to synchronized length so all ranks rechunk at the same step
+        if hasattr(self, '_max_sequences') and len(input_chunks) > self._max_sequences:
+            input_chunks = input_chunks[:self._max_sequences]
+            output_chunks = output_chunks[:self._max_sequences]
+            document_id_chunks = document_id_chunks[:self._max_sequences]
+
         return input_chunks, output_chunks, document_id_chunks
+
+    def set_max_sequences(self, max_sequences: int) -> None:
+        """Truncate to a fixed number of sequences so all ranks rechunk at the same step."""
+        self._max_sequences = max_sequences
+        self.inputs = self.inputs[:max_sequences]
+        self.outputs = self.outputs[:max_sequences]
+        self.doc_ids = self.doc_ids[:max_sequences]
 
     def load_state(self: Datasetv2, dataset_state: dict[str, int]) -> None:
         self.current_idx = dataset_state["current_idx"]
@@ -309,8 +322,8 @@ class DiffusionMaskingStrategy:
     
 
 class FusedDatasetv2(Datasetv2):
-    def __init__(self: FusedDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], mode: str = "causal", shuffle: bool = True):
-        super().__init__(dataset, tokenizer, args, seq_length, ranks, args.seed, shuffle)
+    def __init__(self: FusedDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], seed: int, mode: str = "causal", shuffle: bool = True):
+        super().__init__(dataset, tokenizer, args, seq_length, ranks, seed, shuffle)
         self.mode = mode
         if mode == "causal":
             self.masking_strategy = None
@@ -415,7 +428,7 @@ class FusedDatasetv2(Datasetv2):
 
 
 class ValidationDataset:
-    def __init__(self, dataset: str, tokenizer, args, seq_length, ranks):
+    def __init__(self, dataset: str, tokenizer, args, seq_length, ranks, seed):
         self.dataset = dataset
         self.max_seq_length = seq_length + 1
         self.n_special_tokens = args.n_special_tokens
@@ -429,7 +442,7 @@ class ValidationDataset:
         self.doc_segments = []
         self.orders = []
         self.lens = []
-        self.seed = args.seed
+        self.seed = seed
         self.documents = []
         for rank in ranks:
             documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
@@ -538,8 +551,8 @@ class ValidationCausalDataset(ValidationDataset):
 
 class ValidationMaskedDataset(ValidationDataset):
 
-    def __init__(self, dataset: str, tokenizer, args, seq_length, rank):
-        super().__init__(dataset, tokenizer, args, seq_length, rank)
+    def __init__(self, dataset: str, tokenizer, args, seq_length, rank, seed):
+        super().__init__(dataset, tokenizer, args, seq_length, rank, seed)
 
         self.masking_strategy = SpanMaskingStrategy(args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index)
 
