@@ -1,430 +1,12 @@
 from __future__ import annotations
 import torch
-from typing import TYPE_CHECKING
+import numpy as np
+from typing import TYPE_CHECKING, Literal
 import random
 
 if TYPE_CHECKING:
     from tokenizers import Tokenizer
     from argparse import Namespace
-
-
-class Datasetv2:
-
-    def __init__(self: Datasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], seed: int, shuffle: bool = True) -> None:
-        self.dataset = dataset
-        self.seq_length = seq_length
-        self.n_special_tokens = args.n_special_tokens
-        self.args = args
-        self.shuffle = shuffle
-        self.current_idx = 0
-        self.iterations = 0
-        self.seed = seed
-
-        self.mask_index = tokenizer.token_to_id("<mask>")
-        self.cls_index = tokenizer.token_to_id("<s>")
-        self.pad_index = tokenizer.token_to_id("<pad>")
-
-        # all_documents = []
-        self.documents = []
-        for rank in ranks:
-            documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
-            self.documents.extend(documents)
-            print(f"Dataset {dataset}/{rank:d}.bin loaded", flush=True)
-        # total_num_tokens = sum(len(doc) for doc in all_documents)
-        # remaining_num_tokens = total_num_tokens // args.n_repetitions
-        # self.documents = []
-        # while remaining_num_tokens > 0:
-        #     document = all_documents[len(self.documents)][:remaining_num_tokens]
-        #     self.documents.append(document)
-        #     remaining_num_tokens -= len(document)
-
-        self.inputs, self.outputs, self.doc_ids = self.chunk()
-
-        print(f"Dataset initialized with {len(self.inputs)} sequences", flush=True)
-
-    def chunk(self: Datasetv2) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-        if self.shuffle:
-            random.seed(self.seed + self.iterations)
-            random.shuffle(self.documents)
-
-        input_chunks = []
-        output_chunks = []
-        document_id_chunks = []
-
-        input_ids = torch.LongTensor([])
-        output_ids = torch.LongTensor([])
-        document_ids = torch.LongTensor([])
-        current_document_id = 0
-
-        for document in self.documents:
-            document = torch.cat([torch.LongTensor([self.cls_index]), document])
-
-            input_ids = torch.cat([input_ids, document[:-1]])
-            output_ids = torch.cat([output_ids, document[1:]])
-            document_ids = torch.cat([document_ids, torch.ones_like(document[:-1], dtype=torch.int) * current_document_id])
-
-            while len(input_ids) >= self.seq_length:
-                input_chunks.append(input_ids[:self.seq_length])
-                output_chunks.append(output_ids[:self.seq_length])
-                document_id_chunks.append(document_ids[:self.seq_length])
-                input_ids = input_ids[self.seq_length:]
-                output_ids = output_ids[self.seq_length:]
-                document_ids = torch.zeros_like(input_ids, dtype=torch.int)
-                current_document_id = 0
-
-            current_document_id += 1
-
-        if self.shuffle:
-            indices = list(range(len(input_chunks)))
-            random.shuffle(indices)
-            input_chunks = [input_chunks[i] for i in indices]
-            output_chunks = [output_chunks[i] for i in indices]
-            document_id_chunks = [document_id_chunks[i] for i in indices]
-
-        # Truncate to synchronized length so all ranks rechunk at the same step
-        if hasattr(self, '_max_sequences') and len(input_chunks) > self._max_sequences:
-            input_chunks = input_chunks[:self._max_sequences]
-            output_chunks = output_chunks[:self._max_sequences]
-            document_id_chunks = document_id_chunks[:self._max_sequences]
-
-        return input_chunks, output_chunks, document_id_chunks
-    
-    def set_max_sequences(self, max_sequences: int) -> None:
-        """Truncate to a fixed number of sequences so all ranks rechunk at the same step."""
-        self._max_sequences = max_sequences
-        self.inputs = self.inputs[:max_sequences]
-        self.outputs = self.outputs[:max_sequences]
-        self.doc_ids = self.doc_ids[:max_sequences]
-
-    def load_state(self: Datasetv2, dataset_state: dict[str, int]) -> None:
-        self.current_idx = dataset_state["current_idx"]
-        self.iterations = dataset_state["iterations"]
-        self.inputs, self.outputs, self.doc_ids = self.chunk()
-
-    def get_state(self: Datasetv2) -> dict[str, int]:
-        return {
-            "current_idx": self.current_idx,
-            "iterations": self.iterations,
-        }
-    
-    def __len__(self: Datasetv2) -> int:
-        return len(self.inputs)
-
-
-class MaskedDatasetv2(Datasetv2):
-
-    def __init__(self: MaskedDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, rank: int, shuffle: bool = True):
-        super().__init__(dataset, tokenizer, args, seq_length, rank, args.seed + 12345, shuffle)
-
-        self.masking_strategy = SpanMaskingStrategy(args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index)
-
-    def next(self, current_seq_len, batch_size):
-        all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
-        for _ in range(batch_size):
-
-            input_ids, target_ids, sequence_lengths, real_mask_p = self.__getitem__(self.current_idx)
-            self.current_idx += 1
-            if self.current_idx >= len(self.inputs):
-                if self.shuffle:
-                    self.iterations += 1
-                    self.inputs, self.outputs, self.doc_ids = self.chunk()
-                    print("Dataset reloaded")
-                self.current_idx = 0
-
-            all_input_ids.append(input_ids)
-            all_target_ids.append(target_ids)
-            all_sequence_lengths.append(sequence_lengths)
-            all_real_mask_p.append(real_mask_p)
-
-        input_ids = torch.stack(all_input_ids)
-        target_ids = torch.stack(all_target_ids)
-        sequence_lengths = torch.stack(all_sequence_lengths)
-        real_mask_p = torch.stack(all_real_mask_p).mean()
-
-        return input_ids, target_ids, sequence_lengths, real_mask_p
-
-    def apply_mask(self, input_ids, target_ids, mask_ratios, replacement_ids):
-        mask_p = self.args.mask_p
-        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
-
-        mask = mask_ratios <= mask_p
-        target_mask = torch.cat([mask[1:], torch.ones(1, dtype=torch.bool)])
-        target_ids = torch.where(target_mask, target_ids, -100)
-        input_ids = torch.where(mask, replacement_ids, input_ids)
-
-        real_mask_p = mask.sum() / mask_ratios.numel()
-
-        return input_ids, target_ids, real_mask_p
-
-    def __getitem__(self, index):
-        tokens = self.inputs[index].long()
-        targets = self.outputs[index].long()
-
-        mask_ratios, replacement_tokens = self.masking_strategy(tokens)
-        input_ids, target_ids, real_mask_p = self.apply_mask(tokens, targets, mask_ratios, replacement_tokens)
-        sequence_lengths = self.doc_ids[index]
-
-        return input_ids, target_ids, sequence_lengths, real_mask_p
-
-
-class DiffusionDatasetv2(Datasetv2):
-
-    def __init__(self: DiffusionDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, rank: int, shuffle: bool = True):
-        super().__init__(dataset, tokenizer, args, seq_length, rank, args.seed + 23456, shuffle)
-        self.masking_strategy = DiffusionMaskingStrategy(args.n_special_tokens, args.vocab_size, self.mask_index)
-
-    def next(self, current_seq_len, batch_size):
-        all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
-        for _ in range(batch_size):
-
-            input_ids, target_ids, sequence_lengths, real_mask_p = self.__getitem__(self.current_idx)
-            self.current_idx += 1
-            if self.current_idx >= len(self.inputs):
-                if self.shuffle:
-                    self.iterations += 1
-                    self.inputs, self.outputs, self.doc_ids = self.chunk()
-                    print("Dataset reloaded")
-                self.current_idx = 0
-
-            all_input_ids.append(input_ids)
-            all_target_ids.append(target_ids)
-            all_sequence_lengths.append(sequence_lengths)
-            all_real_mask_p.append(real_mask_p)
-
-        input_ids = torch.stack(all_input_ids)
-        target_ids = torch.stack(all_target_ids)
-        sequence_lengths = torch.stack(all_sequence_lengths)
-        real_mask_p = torch.stack(all_real_mask_p)
-
-        return input_ids, target_ids, sequence_lengths, real_mask_p
-
-    def apply_mask(self, input_ids, target_ids, mask_ratios, replacement_ids):
-        mask_p = torch.rand(1).item()
-        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
-
-        mask = mask_ratios <= mask_p
-        target_mask = torch.cat([mask[1:], torch.ones(1, dtype=torch.bool)])
-        target_ids = torch.where(target_mask, target_ids, -100)
-        input_ids = torch.where(mask, replacement_ids, input_ids)
-
-        real_mask_p = mask.sum() / mask_ratios.numel()
-        real_mask_p = torch.full_like(input_ids, real_mask_p, dtype=torch.float)
-        real_mask_p = (1 - 1e-4) * real_mask_p + 1e-4
-
-        return input_ids, target_ids, real_mask_p
-
-    def __getitem__(self, index):
-        tokens = self.inputs[index].long()
-        targets = self.outputs[index].long()
-
-        mask_ratios, replacement_tokens = self.masking_strategy(tokens)
-        input_ids, target_ids, real_mask_p = self.apply_mask(tokens, targets, mask_ratios, replacement_tokens)
-        sequence_lengths = self.doc_ids[index]
-
-        return input_ids, target_ids, sequence_lengths, real_mask_p
-
-
-class CausalDatasetv2(Datasetv2):
-    def __init__(self: CausalDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, rank: int, shuffle: bool = True):
-        super().__init__(dataset, tokenizer, args, seq_length, rank, args.seed + 34567, shuffle)
-
-    def next(self, current_seq_len, batch_size):
-        all_input_ids, all_target_ids, all_sequence_lengths = [], [], []
-        for _ in range(batch_size):
-
-            input_ids, target_ids, sequence_lengths, _ = self.__getitem__(self.current_idx)
-            self.current_idx += 1
-            if self.current_idx >= len(self.inputs):
-                self.iterations += 1
-
-                if self.shuffle:
-                    self.iterations += 1
-                    self.inputs, self.outputs, self.doc_ids = self.chunk()
-                self.current_idx = 0
-
-            all_input_ids.append(input_ids)
-            all_target_ids.append(target_ids)
-            all_sequence_lengths.append(sequence_lengths)
-
-        input_ids = torch.stack(all_input_ids)
-        target_ids = torch.stack(all_target_ids)
-        sequence_lengths = torch.stack(all_sequence_lengths)
-
-        return input_ids, target_ids, sequence_lengths, torch.zeros([])
-
-    def __getitem__(self, index):
-        input_ids = self.inputs[index].long()
-        target_ids = self.outputs[index].long()
-        sequence_lengths = self.doc_ids[index]
-
-        return input_ids, target_ids, sequence_lengths, torch.zeros([])
-
-
-class SpanMaskingStrategy:
-    def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id):
-        self.n_special_tokens = n_special_tokens
-        self.random_p = random_p
-        self.keep_p = keep_p
-        self.vocab_size = vocab_size
-        self.mask_token_id = mask_token_id
-        self.max_span_length = 3
-
-    def __call__(self, tokens):
-        length = tokens.size(0)
-
-        span_lengths = torch.randint(1, self.max_span_length + 1, size=(length,), dtype=torch.int)
-        cumsum = torch.cumsum(span_lengths, dim=0)
-
-        total_length = cumsum[-1].item()
-        indices = torch.zeros(total_length, dtype=torch.int)
-        indices[cumsum - span_lengths] = torch.arange(length, dtype=torch.int)
-        indices = torch.cummax(indices, dim=0)[0]
-        indices = indices[:length]
-
-        max_index = indices[-1].item()
-        span_random_numbers_1, span_random_numbers_2 = torch.rand([(max_index + 1) * 2]).chunk(2)
-
-        mask_ratios = span_random_numbers_1[indices]
-
-        mask_ratios[tokens < self.n_special_tokens] = float('inf')
-
-        replacement_p = span_random_numbers_2[indices]
-        random_mask = replacement_p < self.random_p
-
-        replacement_tokens = tokens.clone()
-        replacement_tokens[random_mask] = torch.randint(
-            low=self.n_special_tokens,
-            high=self.vocab_size,
-            size=[random_mask.sum().item()],
-            dtype=torch.long
-        )
-        replacement_tokens[replacement_p > (self.random_p + self.keep_p)] = self.mask_token_id
-
-        return mask_ratios, replacement_tokens
-
-
-class DiffusionMaskingStrategy:
-    def __init__(self, n_special_tokens, vocab_size, mask_token_id):
-        self.n_special_tokens = n_special_tokens
-        self.vocab_size = vocab_size
-        self.mask_token_id = mask_token_id
-
-    def __call__(self, tokens):
-        length = tokens.size(0)
-
-        mask_ratios = torch.rand(length)
-        mask_ratios[tokens < self.n_special_tokens] = float('inf')
-
-        replacement_tokens = tokens.clone()
-        replacement_tokens.fill_(self.mask_token_id)
-
-        return mask_ratios, replacement_tokens
-    
-
-class FusedDatasetv2(Datasetv2):
-    def __init__(self: FusedDatasetv2, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], mode: str = "causal", shuffle: bool = True):
-        super().__init__(dataset, tokenizer, args, seq_length, ranks, args.seed, shuffle)
-        self.mode = mode
-        if mode == "causal":
-            self.masking_strategy = None
-        elif mode == "masked":
-            self.masking_strategy = SpanMaskingStrategy(
-                n_special_tokens=args.n_special_tokens,
-                random_p=args.random_p,
-                keep_p=args.keep_p,
-                vocab_size=args.vocab_size,
-                mask_token_id=self.mask_index
-            )
-        else:  # diffusion
-            self.masking_strategy = DiffusionMaskingStrategy(
-                n_special_tokens=args.n_special_tokens,
-                vocab_size=args.vocab_size,
-                mask_token_id=self.mask_index
-            )
-
-    def set_mode(self, mode: Literal["causal", "diffusion", "masked"]) -> None:
-        """Switch the masking strategy without reloading data."""
-        self.mode = mode
-        if mode == "causal":
-            self.masking_strategy = None
-        elif mode == "masked":
-            self.masking_strategy = SpanMaskingStrategy(
-                n_special_tokens=self.args.n_special_tokens,
-                random_p=self.args.random_p,
-                keep_p=self.args.keep_p,
-                vocab_size=self.args.vocab_size,
-                mask_token_id=self.mask_index
-            )
-        elif mode == "diffusion":
-            self.masking_strategy = DiffusionMaskingStrategy(
-                n_special_tokens=self.args.n_special_tokens,
-                vocab_size=self.args.vocab_size,
-                mask_token_id=self.mask_index
-            )
-        else:
-            raise ValueError(f"Unknown mode {mode}")
-
-    def next(self, current_seq_len, batch_size):
-        all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
-        for _ in range(batch_size):
-            input_ids, target_ids, sequence_lengths, real_mask_p = self.__getitem__(self.current_idx)
-            self.current_idx += 1
-            if self.current_idx >= len(self.inputs):
-                if self.shuffle:
-                    self.iterations += 1
-                    self.inputs, self.outputs, self.doc_ids = self.chunk()
-                    print("Dataset reloaded")
-                self.current_idx = 0
-
-            all_input_ids.append(input_ids)
-            all_target_ids.append(target_ids)
-            all_sequence_lengths.append(sequence_lengths)
-            all_real_mask_p.append(real_mask_p)
-
-        input_ids = torch.stack(all_input_ids)
-        target_ids = torch.stack(all_target_ids)
-        sequence_lengths = torch.stack(all_sequence_lengths)
-        
-        if self.mode == "causal":
-            mask_p_out = torch.zeros([])
-        elif self.mode == "diffusion":
-            mask_p_out = torch.stack(all_real_mask_p)      # (batch, seq)
-        else:  # "masked"
-            mask_p_out = torch.stack(all_real_mask_p).mean()  # scalar
-
-        return input_ids, target_ids, sequence_lengths, mask_p_out
-
-    def apply_mask(self, input_ids, target_ids, mask_ratios, replacement_ids):
-        if self.mode == "masked":
-            mask_p = self.args.mask_p
-        else:  # diffusion
-            mask_p = torch.rand(1).item()
-        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
-
-        mask = mask_ratios <= mask_p
-        target_mask = torch.cat([mask[1:], torch.ones(1, dtype=torch.bool)])
-        target_ids = torch.where(target_mask, target_ids, -100)
-        input_ids = torch.where(mask, replacement_ids, input_ids)
-
-        real_mask_p = mask.sum() / mask_ratios.numel()
-        if self.mode == "diffusion":
-            real_mask_p = torch.full_like(input_ids, real_mask_p, dtype=torch.float)
-            real_mask_p = (1 - 1e-4) * real_mask_p + 1e-4
-
-        return input_ids, target_ids, real_mask_p
-    
-    def __getitem__(self, index):
-        input_ids = self.inputs[index].long()
-        target_ids = self.outputs[index].long()
-        sequence_lengths = self.doc_ids[index]
-
-        if self.masking_strategy is not None:
-            mask_ratios, replacement_tokens = self.masking_strategy(input_ids)
-            input_ids, target_ids, real_mask_p = self.apply_mask(input_ids, target_ids, mask_ratios, replacement_tokens)
-        else:
-            real_mask_p = torch.zeros([])
-        
-        return input_ids, target_ids, sequence_lengths, real_mask_p
 
 
 class ValidationDataset:
@@ -654,3 +236,256 @@ class ValidationMaskedDataset(ValidationDataset):
         sequence_lengths = sequence_lengths[:-1]
 
         return input_ids, target_ids, sequence_lengths, real_mask_p
+
+
+class TrainDataset:
+    def __init__(self: TrainDataset, dataset: str, tokenizer: Tokenizer, args: Namespace, seq_length: int, ranks: list[int], seed: int, mode: str = "causal", shuffle: bool = True) -> None:
+        self.dataset = dataset
+        self.seq_length = seq_length
+        self.n_special_tokens = args.n_special_tokens
+        self.args = args
+        self.shuffle = shuffle
+        self.current_idx = 0
+        self.iterations = 0
+        self.seed = seed
+
+        self.mask_index = tokenizer.token_to_id("<mask>")
+        self.cls_index = tokenizer.token_to_id("<s>")
+        self.pad_index = tokenizer.token_to_id("<pad>")
+
+        self.tensors, self.doc_boundaries = self._build_documents(dataset, ranks)
+
+        self.num_sequences = len(self.tensors) // self.seq_length
+
+        self.tensors = self.tensors[:self.num_sequences * self.seq_length]
+        self.doc_ids = self._build_doc_ids(self.doc_boundaries)
+
+        self.order = np.arange(len(self.tensors) // self.seq_length)
+        if self.shuffle:
+            self._reshuffle()
+        print(f"Order of sequences is initialized to {self.order}", flush=True)
+
+        print(f"TrainDataset initialized with {len(self.order)} sequences", flush=True)
+
+        self.mode = mode
+        if mode == "causal":
+            self.masking_strategy = None
+        elif mode == "masked":
+            self.masking_strategy = SpanMaskingStrategy(
+                n_special_tokens=args.n_special_tokens,
+                random_p=args.random_p,
+                keep_p=args.keep_p,
+                vocab_size=args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+        else:  # diffusion
+            self.masking_strategy = DiffusionMaskingStrategy(
+                n_special_tokens=args.n_special_tokens,
+                vocab_size=args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+
+    def set_mode(self, mode: Literal["causal", "diffusion", "masked"]) -> None:
+        """Switch the masking strategy without reloading data."""
+        self.mode = mode
+        if mode == "causal":
+            self.masking_strategy = None
+        elif mode == "masked":
+            self.masking_strategy = SpanMaskingStrategy(
+                n_special_tokens=self.args.n_special_tokens,
+                random_p=self.args.random_p,
+                keep_p=self.args.keep_p,
+                vocab_size=self.args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+        elif mode == "diffusion":
+            self.masking_strategy = DiffusionMaskingStrategy(
+                n_special_tokens=self.args.n_special_tokens,
+                vocab_size=self.args.vocab_size,
+                mask_token_id=self.mask_index
+            )
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+    def _build_documents(self: TrainDataset, dataset: str, ranks: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        all_documents = []
+        boundaries = [0]
+        total_tokens = 0
+        for rank in ranks:
+            documents = torch.load(f"{dataset}/{rank:d}.bin", weights_only=False)
+            for document in documents:
+                doc_with_cls = torch.cat([torch.LongTensor([self.cls_index]), document])
+                total_tokens += len(doc_with_cls)
+                boundaries.append(total_tokens)
+                all_documents.append(doc_with_cls)
+        tensors = torch.cat(all_documents)
+        boundaries = torch.tensor(boundaries, dtype=torch.long)
+        print(f"TrainDataset initialized with {len(tensors)} tokens and {len(boundaries) - 1} documents", flush=True)
+
+        return tensors, boundaries
+
+    def _build_doc_ids(self: TrainDataset, boundaries: torch.Tensor) -> torch.Tensor:
+        doc_ids = torch.zeros_like(self.tensors, dtype=torch.long)
+        for i in range(len(boundaries) - 1):
+            start = boundaries[i]
+            end = min(boundaries[i + 1], len(self.tensors))
+            if start >= len(self.tensors):
+                break
+            doc_ids[start:end] = i
+        return doc_ids
+
+    def _reshuffle(self) -> None:
+        """Permute sequence order (no data copying)."""
+        rng = np.random.default_rng(self.seed + self.iterations)
+        rng.shuffle(self.order)
+
+    def _apply_mask(self, input_ids, target_ids, mask_ratios, replacement_ids):
+        if self.mode == "masked":
+            mask_p = self.args.mask_p
+        else:  # diffusion
+            mask_p = torch.rand(1).item()
+        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
+
+        mask = mask_ratios <= mask_p
+        target_mask = torch.cat([mask[1:], torch.ones(1, dtype=torch.bool)])
+        target_ids = torch.where(target_mask, target_ids, -100)
+        input_ids = torch.where(mask, replacement_ids, input_ids)
+
+        real_mask_p = mask.sum() / mask_ratios.numel()
+        if self.mode == "diffusion":
+            real_mask_p = torch.full_like(input_ids, real_mask_p, dtype=torch.float)
+            real_mask_p = (1 - 1e-4) * real_mask_p + 1e-4
+
+        return input_ids, target_ids, real_mask_p
+
+    def next(self: TrainDataset, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
+        for _ in range(batch_size):
+            input_ids, target_ids, doc_ids = self.__getitem__(self.current_idx)
+            self.current_idx += 1
+            if self.current_idx >= len(self.order):
+                if self.shuffle:
+                    self.iterations += 1
+                    self._reshuffle()
+                    print("TrainDataset reloaded")
+                self.current_idx = 0
+
+            # Apply masking if needed
+            if self.masking_strategy is not None:
+                mask_ratios, replacement_tokens = self.masking_strategy(input_ids)
+                input_ids, target_ids, real_mask_p = self._apply_mask(
+                    input_ids, target_ids, mask_ratios, replacement_tokens
+                )
+            else:
+                real_mask_p = torch.zeros([])
+
+            all_input_ids.append(input_ids)
+            all_target_ids.append(target_ids)
+            all_sequence_lengths.append(doc_ids)
+            all_real_mask_p.append(real_mask_p)
+
+        input_ids = torch.stack(all_input_ids)
+        target_ids = torch.stack(all_target_ids)
+        sequence_lengths = torch.stack(all_sequence_lengths)
+        
+        if self.mode == "causal":
+            mask_p_out = torch.zeros([])
+        elif self.mode == "diffusion":
+            mask_p_out = torch.stack(all_real_mask_p)      # (batch, seq)
+        else:  # "masked"
+            mask_p_out = torch.stack(all_real_mask_p).mean()  # scalar
+
+        return input_ids, target_ids, sequence_lengths, mask_p_out
+
+    def __getitem__(self: TrainDataset, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        start = self.order[idx] * self.seq_length
+        end = start + self.seq_length
+        chunk = self.tensors[start:end + 1]
+        if len(chunk) < self.seq_length + 1:
+            chunk = torch.cat([chunk, torch.full((self.seq_length + 1 - len(chunk),), self.pad_index, dtype=torch.long)])
+        
+        input_ids = chunk[:-1]
+        target_ids = chunk[1:]
+        doc_ids = self.doc_ids[start:end]
+        doc_ids = doc_ids - doc_ids[0]  # Reset doc_ids to start from 0 for each sequence
+        return input_ids, target_ids, doc_ids
+
+    def load_state(self: TrainDataset, dataset_state: dict[str, int]) -> None:
+        self.current_idx = dataset_state["current_idx"]
+        self.iterations = dataset_state["iterations"]
+        self._reshuffle()
+
+    def load_state_from_num_sequences_seen(self: TrainDataset, num_sequences_seen: int) -> None:
+        self.iterations = num_sequences_seen // self.num_sequences
+        self.current_idx = num_sequences_seen % self.num_sequences
+        self._reshuffle()
+
+    def get_state(self: TrainDataset) -> dict[str, int]:
+        return {
+            "current_idx": self.current_idx,
+            "iterations": self.iterations,
+        }
+    
+    def __len__(self: TrainDataset) -> int:
+        return len(self.order)
+
+
+class SpanMaskingStrategy:
+    def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id):
+        self.n_special_tokens = n_special_tokens
+        self.random_p = random_p
+        self.keep_p = keep_p
+        self.vocab_size = vocab_size
+        self.mask_token_id = mask_token_id
+        self.max_span_length = 3
+
+    def __call__(self, tokens):
+        length = tokens.size(0)
+
+        span_lengths = torch.randint(1, self.max_span_length + 1, size=(length,), dtype=torch.int)
+        cumsum = torch.cumsum(span_lengths, dim=0)
+
+        total_length = cumsum[-1].item()
+        indices = torch.zeros(total_length, dtype=torch.int)
+        indices[cumsum - span_lengths] = torch.arange(length, dtype=torch.int)
+        indices = torch.cummax(indices, dim=0)[0]
+        indices = indices[:length]
+
+        max_index = indices[-1].item()
+        span_random_numbers_1, span_random_numbers_2 = torch.rand([(max_index + 1) * 2]).chunk(2)
+
+        mask_ratios = span_random_numbers_1[indices]
+
+        mask_ratios[tokens < self.n_special_tokens] = float('inf')
+
+        replacement_p = span_random_numbers_2[indices]
+        random_mask = replacement_p < self.random_p
+
+        replacement_tokens = tokens.clone()
+        replacement_tokens[random_mask] = torch.randint(
+            low=self.n_special_tokens,
+            high=self.vocab_size,
+            size=[random_mask.sum().item()],
+            dtype=torch.long
+        )
+        replacement_tokens[replacement_p > (self.random_p + self.keep_p)] = self.mask_token_id
+
+        return mask_ratios, replacement_tokens
+
+
+class DiffusionMaskingStrategy:
+    def __init__(self, n_special_tokens, vocab_size, mask_token_id):
+        self.n_special_tokens = n_special_tokens
+        self.vocab_size = vocab_size
+        self.mask_token_id = mask_token_id
+
+    def __call__(self, tokens):
+        length = tokens.size(0)
+
+        mask_ratios = torch.rand(length)
+        mask_ratios[tokens < self.n_special_tokens] = float('inf')
+
+        replacement_tokens = tokens.clone()
+        replacement_tokens.fill_(self.mask_token_id)
+
+        return mask_ratios, replacement_tokens

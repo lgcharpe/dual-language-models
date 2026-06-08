@@ -22,7 +22,7 @@ from dual_language_models.model.model import Model
 from dual_language_models.optimizers.kimi_muon import Muon
 from dual_language_models.optimizers.normuon import NorMuonWithAuxAdam
 from dual_language_models.utils import trapezoid_schedule, MaskScheduler, is_main_process, seed_everything, cosine_schedule_with_warmup, cosine_schedule_with_warmup_cooldown, flat_with_warmup_schedule, trapezoid_schedule_sqrt
-from dual_language_models.pretraining.dataset import ValidationCausalDataset, ValidationMaskedDataset, FusedDatasetv2
+from dual_language_models.pretraining.dataset import ValidationCausalDataset, ValidationMaskedDataset, TrainDataset
 from dual_language_models.metrics import TrainingMetrics
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.suppress_errors = True
@@ -677,11 +677,14 @@ def save_checkpoint(model, optimizer, lr_scheduler, mask_scheduler, global_step,
         # )
 
 
-def load_train_dataset(args, tokenizer):
+def load_train_dataset(args, tokenizer, global_step=0):
     valid_diffusion_dataset = ValidationMaskedDataset(args.valid_path, tokenizer, args, args.max_seq_length, args.shard_ranks)
     valid_causal_dataset = ValidationCausalDataset(args.valid_path, tokenizer, args, args.max_seq_length, args.shard_ranks)
 
-    train_dataset = FusedDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
+    train_dataset = TrainDataset(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, args.seed, shuffle=True)
+    if global_step > 0:
+        num_sequences_seen = global_step * args.global_batch_size
+        train_dataset.load_state_from_num_sequences_seen(num_sequences_seen)
 
     # train_diffusion_dataset = DiffusionDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
     # train_causal_dataset = CausalDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
@@ -697,7 +700,7 @@ if __name__ == "__main__":
 
     setup_training(args, tokenizer)
     model, ddp_model, optimizer, lr_scheduler, mask_scheduler, global_step = prepare_model_and_optimizer(args)
-    train_dataset, valid_diffusion_dataset, valid_causal_dataset = load_train_dataset(args, tokenizer)
+    train_dataset, valid_diffusion_dataset, valid_causal_dataset = load_train_dataset(args, tokenizer, global_step)
 
     local_len = torch.tensor(len(train_dataset), device=args.device)
     dist.all_reduce(local_len, op=dist.ReduceOp.MIN)
