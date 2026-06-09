@@ -304,7 +304,7 @@ def training_loop(model, ddp_model, train_diffusion_dataset, train_causal_datase
     # calculate the number of forward passes to perform
     num_steps = int(args.max_steps * args.accumulate_steps)
 
-    # Initialize the progress bar
+    # initialize the progress bar
     progress_bar = tqdm(total=args.max_steps, initial=global_step, disable=not is_main_process(), desc="Train iteration")
 
     # iterate over the steps
