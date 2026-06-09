@@ -413,6 +413,7 @@ class TrainDataset:
     def load_state_from_num_sequences_seen(self: TrainDataset, num_sequences_seen: int) -> None:
         self.iterations = num_sequences_seen // self.num_sequences
         self.current_idx = num_sequences_seen % self.num_sequences
+        print(f"TrainDataset loaded state from {num_sequences_seen} sequences seen: iteration {self.iterations}, current_idx {self.current_idx}", flush=True)
         if self.shuffle:
             self._reshuffle()
 

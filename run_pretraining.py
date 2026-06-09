@@ -54,6 +54,7 @@ def parse_arguments():
     parser.add_argument("--local_batch_size", default=8, type=int, help="Batch size for training per GPU.")
     parser.add_argument("--global_batch_size", default=2048, type=int, help="Total batch size for training per GPUs and per grad accumulation step.")
     parser.add_argument("--learning_rate", default=7e-3, type=float, help="The initial learning rate for AdamW.")
+    parser.add_argument("--adam_learning_rate", default=5e-4, type=float, help="The learning rate for Adam optimizer.")
     parser.add_argument("--number_of_tokens", default=6e11 * 4, type=int, help="Total number of tokens to train on.")
     parser.add_argument("--max_steps", default=2048 * 4, type=int)
     parser.add_argument("--document_skip", default=1, type=int)
@@ -232,7 +233,7 @@ def prepare_model_and_optimizer(args):
 
     param_groups = [
         {"params": muon_parameters, "use_muon": True, "lr": args.learning_rate, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95},
-        {"params": adamw_parameters, "use_muon": False, "lr": args.learning_rate, "weight_decay": 0.0, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2)},
+        {"params": adamw_parameters, "use_muon": False, "lr": args.adam_learning_rate, "weight_decay": 0.0, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2)},
     ]
 
     if is_main_process():
@@ -544,10 +545,10 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
     local_step = 0
     valid_steps = 0
 
-    switch_start = time.perf_counter()
+    # switch_start = time.perf_counter()
     model.change_model_type(args.valid_mask_mode, args.device)
-    switch_end = time.perf_counter()
-    print(f"[rank {args.rank}] Switched model type to {args.valid_mask_mode} in {switch_end - switch_start:.2f} seconds", flush=True)
+    # switch_end = time.perf_counter()
+    # print(f"[rank {args.rank}] Switched model type to {args.valid_mask_mode} in {switch_end - switch_start:.2f} seconds", flush=True)
 
     valid_dataset = valid_diffusion_dataset if args.valid_mask_mode == "masked" else valid_causal_dataset
 
@@ -579,15 +580,16 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
             continue
 
         # be careful here, not all GPUs work with the same training objective
-        if args.dataset_type == "masked":
-            total_mlm_loss = total_loss / (args.hybrid_numerator / args.hybrid_denominator)
-            total_mlm_accuracy = total_accuracy / (args.hybrid_numerator / args.hybrid_denominator)
+        ratio = 0.5
+        if args.valid_mask_mode == "masked":
+            total_mlm_loss = total_loss / ratio
+            total_mlm_accuracy = total_accuracy / ratio
             total_clm_loss = torch.zeros_like(total_mlm_loss)
             total_clm_accuracy = torch.zeros_like(total_mlm_accuracy)
-            total_mask_p = total_mask_p / (args.hybrid_numerator / args.hybrid_denominator)
+            total_mask_p = total_mask_p / ratio
         else:
-            total_clm_loss = total_loss / (1 - args.hybrid_numerator / args.hybrid_denominator)
-            total_clm_accuracy = total_accuracy / (1 - args.hybrid_numerator / args.hybrid_denominator)
+            total_clm_loss = total_loss / (1 - ratio)
+            total_clm_accuracy = total_accuracy / (1 - ratio)
             total_mlm_loss = torch.zeros_like(total_clm_loss)
             total_mlm_accuracy = torch.zeros_like(total_clm_accuracy)
             total_mask_p = torch.zeros_like(total_mask_p)
@@ -621,10 +623,10 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
         if valid_steps == args.validation_steps:
             break
     
-    switch_start = time.perf_counter()
+    # switch_start = time.perf_counter()
     model.change_model_type(args.dataset_type, args.device)
-    switch_end = time.perf_counter()
-    print(f"[rank {args.rank}] Switched model type to {args.dataset_type} in {switch_end - switch_start:.2f} seconds", flush=True)
+    # switch_end = time.perf_counter()
+    # print(f"[rank {args.rank}] Switched model type to {args.dataset_type} in {switch_end - switch_start:.2f} seconds", flush=True)
 
 
 def save(model, optimizer, lr_scheduler, mask_scheduler, global_step, train_dataset, args):
