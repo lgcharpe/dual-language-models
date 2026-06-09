@@ -95,11 +95,12 @@ class NorMuon(torch.optim.Optimizer):
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                         state["R"] = p.norm()
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
-                    update.mul_(state["R"] / (update.norm() + 1e-7))  
+                    update = update.reshape(p.shape)
+                    update.mul_(state["R"] / max(update.norm(), 1e-10))  
                     # if group["weight_decay"] and had_grad:
                     #     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                    p.mul_(state["R"] / (p.norm() + 1e-7))  # Renormalize to original norm
+                    p.add_(update, alpha=-group["lr"])
+                    p.mul_(state["R"] / max(p.norm(), 1e-10))  # Renormalize to original norm
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
         return loss
@@ -135,7 +136,7 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                 update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
                 # if group["weight_decay"] and had_grad:
                 #     p.mul_(1 - group["lr"] * group["weight_decay"])
-                update.mul_(state["R"] / (update.norm() + 1e-7))
+                update.mul_(state["R"] / max(update.norm(), 1e-10))
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
                 p.mul_(state["R"] / (p.norm() + 1e-7))  # Renormalize to original norm
 
@@ -197,13 +198,19 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                             state["momentum_buffer"] = torch.zeros_like(p)
                             state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                             state["R"] = p.norm()
+                            print(f"Initialized R for parameter of shape {p.shape} to {state['R'].item():.4f}")
                         update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                                 beta=group["momentum"], beta2=group["beta2"], polar_express=self.polar_express)
-                        update.mul_(state["R"] / (update.norm() + 1e-7))
+                        print(f"Update shape for parameter of shape {p.shape}: {update.shape}")
+                        update = update.reshape(p.shape)
+                        update.mul_(state["R"] / max(update.norm(), 1e-10))
+                        print(f"Update norm for parameter of shape {p.shape}: {update:.4f}")
+                        print(f"R before update for parameter of shape {p.shape}: {state['R'].item():.4f}")
+    
                         # if group["weight_decay"] and had_grad:
                         #     p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                        p.mul_(state["R"] / (p.norm() + 1e-7))  # Renormalize to original norm
+                        p.add_(update, alpha=-group["lr"])
+                        p.mul_(state["R"] / p.norm())  # Renormalize to original norm
                     dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
             else:
                 for p in group["params"]:
@@ -265,13 +272,19 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                         state["R"] = p.norm()
+                        print(f"Initialized R for parameter of shape {p.shape} to {state['R'].item():.4f}")
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                             beta=group["momentum"], beta2=group["beta2"])
-                    update.mul_(state["R"] / (update.norm() + 1e-7))
+                    print(f"Update shape for parameter of shape {p.shape}: {update.shape}")
+                    update = update.reshape(p.shape)
+                    update.mul_(state["R"] / max(update.norm(), 1e-10))
+                    print(f"Update norm for parameter of shape {p.shape}: {update:.4f}")
+                    print(f"R before update for parameter of shape {p.shape}: {state['R'].item():.4f}")
+
                     # if group["weight_decay"] and had_grad:
                     #     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
-                    p.mul_(state["R"] / (p.norm() + 1e-7))  # Renormalize to original norm
+                    p.add_(update, alpha=-group["lr"])
+                    p.mul_(state["R"] / p.norm())  # Renormalize to original norm
             else:
                 for p in group["params"]:
                     had_grad = p.grad is not None
