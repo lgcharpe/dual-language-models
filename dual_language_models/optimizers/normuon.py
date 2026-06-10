@@ -220,7 +220,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
     """
     Non-distributed counterpart to NorMuonWithAuxAdam.
     """
-    def __init__(self, param_groups):
+    def __init__(self, param_groups, polar_express: bool = False):
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -228,14 +228,15 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon", "use_adamh"}
             else:
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon", "use_adamh"}
         super().__init__(param_groups, dict())
+        self.polar_express = polar_express
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -256,7 +257,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
-                                            beta=group["momentum"], beta2=group["beta2"])
+                                            beta=group["momentum"], beta2=group["beta2"], polar_express=self.polar_express)
                     if group["weight_decay"] and had_grad:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
