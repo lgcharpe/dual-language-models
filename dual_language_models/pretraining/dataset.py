@@ -54,6 +54,8 @@ class ValidationCausalDataset(ValidationDataset):
     def next(self, current_seq_len, batch_size):
         all_input_ids, all_target_ids, all_sequence_lengths = [], [], []
         for _ in range(batch_size):
+            if self.current_idx > self.len:
+                break
             input_ids, target_ids, sequence_lengths, _ = self._getitem()
             self.current_idx += 1
 
@@ -142,6 +144,8 @@ class ValidationMaskedDataset(ValidationDataset):
     def next(self, current_seq_len, batch_size):
         all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
         for _ in range(batch_size):
+            if self.current_idx > self.len:
+                break
             input_ids, target_ids, sequence_lengths, real_mask_p = self._getitem()
             self.current_idx += 1
 
