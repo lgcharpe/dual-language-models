@@ -231,7 +231,8 @@ class Classifier(nn.Module):
         self.pre_norm: nn.RMSNorm
 
         self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
-        self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
+        if config.projection:
+            self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
         self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=True)
 
         self.initialize(config.hidden_size, config.vocab_size, config.tie_weights, embedding_weights)
@@ -240,7 +241,8 @@ class Classifier(nn.Module):
     def initialize(self, hidden_size: int, vocab_size: int, tie_weights: bool, embedding_weights: nn.Parameter) -> None:
         proj_std: float = math.sqrt(2.0 / (hidden_size + 4*hidden_size))
 
-        nn.init.trunc_normal_(self.projection.weight, mean=0.0, std=proj_std, a=-2*proj_std, b=2*proj_std)
+        if hasattr(self, "projection"):
+            nn.init.trunc_normal_(self.projection.weight, mean=0.0, std=proj_std, a=-2*proj_std, b=2*proj_std)
         if tie_weights:
             self.emb2vocab.weight = embedding_weights
         else:
@@ -266,7 +268,8 @@ class Classifier(nn.Module):
             hidden_layer = torch.index_select(hidden_layer.flatten(0, 1), 0, torch.nonzero(labels.flatten() != -100).squeeze())
 
         hidden_layer = self.pre_norm(hidden_layer.float()).type_as(hidden_layer)
-        hidden_layer = self.project(hidden_layer)
+        if hasattr(self, "projection"):
+            hidden_layer = self.project(hidden_layer)
         output = self.calculate_output(hidden_layer)
 
         return output
@@ -294,7 +297,7 @@ class SelfAttention(nn.Module):
         self.bidirectional_mask = None
         self.mask = None
 
-        self.initialize()
+        self.initialize(config.zero_init)
 
     @staticmethod
     def causal_mask_mode(b, h, q_idx, kv_idx):
@@ -324,11 +327,14 @@ class SelfAttention(nn.Module):
         self.mask = self.causal_mask if self.is_causal else self.bidirectional_mask
 
     @torch.no_grad()
-    def initialize(self) -> None:
+    def initialize(self, zero_init: bool = False) -> None:
         std: float = math.sqrt(2.0 / (self.hidden_size + 4*self.hidden_size))
         for weight in self.qkv_proj.weights:
             nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2*std, b=2*std)
-        self.out_proj.weight.data.zero_()
+        if zero_init:
+            self.out_proj.weight.data.zero_()
+        else:
+            nn.init.trunc_normal_(self.out_proj.weight, mean=0.0, std=std, a=-2*std, b=2*std)
 
     def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
         hidden_layer = self.pre_norm(hidden_layer.float()).type_as(hidden_layer)
@@ -371,15 +377,19 @@ class FeedForward(nn.Module):
         self.activation = SwiGLU()
         self.down_proj = CastedLinear(config.intermediate_size, config.hidden_size, bias=False)
 
-        self.initialize(config.hidden_size)
+        self.initialize(config.hidden_size, config.zero_init)
 
     @torch.no_grad()
-    def initialize(self, hidden_size: int) -> None:
+    def initialize(self, hidden_size: int, zero_init: bool = False) -> None:
         std: float = math.sqrt(2.0 / (5*hidden_size))
 
         for weight in self.up_proj.weights:
             nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2*std, b=2*std)
-        self.down_proj.weight.data.zero_()
+        
+        if zero_init:
+            self.down_proj.weight.data.zero_()
+        else:
+            nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=std, a=-2*std, b=2*std)
 
     def up_project(self, hidden_layer: torch.Tensor) -> torch.Tensor:
         hidden_layer = self.pre_norm(hidden_layer.float()).type_as(hidden_layer)

@@ -12,5 +12,8 @@
     "num_layers": 12,
     "rope_theta": 10000,
     "vocab_size": 128000,
-    "tie_weights": false
+    "tie_weights": false,
+    "zero_init": false,
+    "projection": true,
+    "use_liger": true
 }

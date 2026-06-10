@@ -162,22 +162,31 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
             if group["use_muon"]:
                 group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
                 group["lr"] = group.get("lr", 0.02)
+                group["alpha_0"] = group.get("alpha_0", 0.05)
+                group["alpha_1"] = group.get("alpha_1", 9.0)
+                group["beta_3"] = group.get("beta_3", 3.5)
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_adamh", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "alpha_0", "alpha_1", "beta_3", "momentum", "beta2", "weight_decay", "use_adamh", "use_muon"}
             elif group["use_adamh"]:
                 group["lr"] = group.get("lr", 3e-4)
+                group["alpha_0"] = group.get("alpha_0", 0.05)
+                group["alpha_1"] = group.get("alpha_1", 9.0)
+                group["beta_3"] = group.get("beta_3", 3.5)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_adamh", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "alpha_0", "alpha_1", "beta_3", "betas", "eps", "weight_decay", "use_adamh", "use_muon"}
             else:
                 group["lr"] = group.get("lr", 3e-4)
+                group["alpha_0"] = group.get("alpha_0", 0.01)
+                group["alpha_1"] = group.get("alpha_1", 29.0)
+                group["beta_3"] = group.get("beta_3", 3.5)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_adamh", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "alpha_0", "alpha_1", "beta_3", "betas", "eps", "weight_decay", "use_adamh", "use_muon"}
         super().__init__(param_groups, dict())
         self.polar_express = polar_express
 
@@ -207,7 +216,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                         update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                                 beta=group["momentum"], beta2=group["beta2"], polar_express=self.polar_express)
                         update.mul_(state["R"] / max(update.norm(), 1e-10))
-
+                        group["lr"] = group["alpha_0"] / (1 + min(group["beta_3"] * (state["momentum_buffer"].norm()).pow(2).item(), group["alpha_1"]))
                         # if group["weight_decay"] and had_grad:
                         #     p.mul_(1 - group["lr"] * group["weight_decay"])
                         p.add_(update, alpha=-group["lr"])
@@ -228,6 +237,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
                     update.mul_(state["R"] / max(update.norm(), 1e-10))
+                    group["lr"] = group["alpha_0"] / (1 + min(group["beta_3"] * (state["exp_avg"].norm()).pow(2).item(), group["alpha_1"]))
                     p.add_(update, alpha=-group["lr"])
                     p.mul_(state["R"] / max(p.norm(), 1e-10))  # Renormalize to original norm
             else:
@@ -243,6 +253,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                     state["step"] += 1
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
+                    group["lr"] = group["alpha_0"] / (1 + min(group["beta_3"] * (state["exp_avg"].norm()).pow(2).item(), group["alpha_1"]))
                     if group["weight_decay"] and had_grad:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])

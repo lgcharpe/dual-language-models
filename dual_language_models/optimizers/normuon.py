@@ -158,13 +158,13 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon", "use_adamh"}
             else:
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
+                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon", "use_adamh"}
         super().__init__(param_groups, dict())
         self.polar_express = polar_express
 
