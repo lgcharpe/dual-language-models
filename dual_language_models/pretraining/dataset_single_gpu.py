@@ -54,6 +54,8 @@ class ValidationCausalDataset(ValidationDataset):
     def next(self, current_seq_len, batch_size):
         all_input_ids, all_target_ids, all_sequence_lengths = [], [], []
         for _ in range(batch_size):
+            if self.current_idx > self.len:
+                break
             input_ids, target_ids, sequence_lengths, _ = self._getitem()
             self.current_idx += 1
 
@@ -64,8 +66,9 @@ class ValidationCausalDataset(ValidationDataset):
         input_ids = torch.stack(all_input_ids)
         target_ids = torch.stack(all_target_ids)
         sequence_lengths = torch.stack(all_sequence_lengths)
+        causal_mask = torch.ones(len(input_ids), dtype=torch.bool)
 
-        return input_ids, target_ids, sequence_lengths, torch.zeros([])
+        return input_ids, target_ids, sequence_lengths, torch.zeros([]), causal_mask
 
     def _getitem(self):
         tokens = self.doc_segments[self.current_idx]
@@ -78,8 +81,9 @@ class ValidationCausalDataset(ValidationDataset):
         sequence_lengths = torch.full((seq_length,), document_index, dtype=torch.int)
 
         while self.max_seq_length - input_ids.size(0) > 1:
-            assert self.current_idx < self.len, "Looping around, make your validation dataset bigger."
             self.current_idx += 1
+            if self.current_idx >= self.len:
+                break
             tokens = self.doc_segments[self.current_idx].long()
             seq_length = min(self.max_seq_length - input_ids.size(0), tokens.size(0))
 
@@ -142,6 +146,8 @@ class ValidationMaskedDataset(ValidationDataset):
     def next(self, current_seq_len, batch_size):
         all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
         for _ in range(batch_size):
+            if self.current_idx > self.len:
+                break
             input_ids, target_ids, sequence_lengths, real_mask_p = self._getitem()
             self.current_idx += 1
 
@@ -154,8 +160,9 @@ class ValidationMaskedDataset(ValidationDataset):
         target_ids = torch.stack(all_target_ids)
         sequence_lengths = torch.stack(all_sequence_lengths)
         real_mask_p = torch.stack(all_real_mask_p).mean()
+        causal_mask = torch.zeros(len(input_ids), dtype=torch.bool)
 
-        return input_ids, target_ids, sequence_lengths, real_mask_p
+        return input_ids, target_ids, sequence_lengths, real_mask_p, causal_mask
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = self.args.mask_p_min
@@ -181,8 +188,9 @@ class ValidationMaskedDataset(ValidationDataset):
         sequence_lengths = torch.full((seq_length,), document_index, dtype=torch.int)
 
         while self.max_seq_length - input_ids.size(0) > 1:
-            assert self.current_idx < self.len, "Looping around, make your validation dataset bigger."
             self.current_idx += 1
+            if self.current_idx >= self.len:
+                break
             tokens = self.doc_segments[self.current_idx].long()
             seq_length = min(self.max_seq_length - input_ids.size(0), tokens.size(0))
 
@@ -333,6 +341,8 @@ class TrainDataset:
         all_input_ids, all_target_ids, all_sequence_lengths, all_real_mask_p = [], [], [], []
         num_causal = int(batch_size * self.causal_ratio)
         mask_p_out = torch.zeros([])
+        causal_mask = torch.zeros(batch_size, dtype=torch.bool)
+        causal_mask[:num_causal] = True
         for i in range(batch_size):
             input_ids, target_ids, doc_ids = self.__getitem__(self.current_idx)
             self.current_idx += 1
@@ -365,7 +375,7 @@ class TrainDataset:
             else:  # "masked"
                 mask_p_out = torch.stack(all_real_mask_p).mean()  # scalar
 
-        return input_ids, target_ids, sequence_lengths, mask_p_out
+        return input_ids, target_ids, sequence_lengths, mask_p_out, causal_mask
 
     def __getitem__(self: TrainDataset, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         start = self.order[idx] * self.seq_length

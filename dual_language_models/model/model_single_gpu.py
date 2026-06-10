@@ -118,7 +118,7 @@ class Model(nn.Module):
 
         return encodings
 
-    def forward(self, input_ids: torch.Tensor, doc_ids: torch.Tensor, labels: torch.Tensor | None = None) -> ModelOutput:
+    def forward(self, input_ids: torch.Tensor, doc_ids: torch.Tensor, causal_mask: torch.Tensor, labels: torch.Tensor | None = None) -> ModelOutput:
         word_embeddings: torch.Tensor
         encodings: torch.Tensor
         logits: torch.Tensor
@@ -126,7 +126,7 @@ class Model(nn.Module):
         output: ModelOutput
 
         word_embeddings = self.embedding(input_ids).bfloat16()
-        encodings = self.encoder(word_embeddings, doc_ids).bfloat16()
+        encodings = self.encoder(word_embeddings, doc_ids, causal_mask).bfloat16()
         logits = self.classifier(encodings, labels).float()
 
         output = ModelOutput(logits=logits, loss=None, perplexity=None, z_loss=None, accuracy=None, num_tokens=None)
@@ -166,9 +166,9 @@ class Encoder(nn.Module):
         for layer in self.layers:
             layer._create_mask(device, batch_size)
 
-    def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
-            hidden_layer = layer(hidden_layer, doc_ids)
+            hidden_layer = layer(hidden_layer, doc_ids, causal_mask)
 
         return hidden_layer
 
@@ -187,10 +187,10 @@ class Layer(nn.Module):
     def _create_mask(self, device: torch.device, batch_size: int) -> None:
         self.attention._create_block_mask(device, batch_size)
 
-    def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
         output: torch.Tensor
 
-        attention_layer = self.attention(hidden_layer, doc_ids)
+        attention_layer = self.attention(hidden_layer, doc_ids, causal_mask)
         mlp_layer = self.mlp(hidden_layer + attention_layer)
         output = hidden_layer + attention_layer + mlp_layer
 
@@ -292,8 +292,6 @@ class SelfAttention(nn.Module):
         self.scale: float = 1.0 / math.sqrt(self.d_h)
 
         self.sequence_length = config.max_sequence_length
-        self.is_causal = config.dataset_type == "causal"
-        self.causal_ratio = max(min(config.causal_ratio if hasattr(config, "causal_ratio") else 1.0, 1.0), 0.0)
         self.mask = None
 
         self.initialize(config.zero_init)
@@ -305,26 +303,29 @@ class SelfAttention(nn.Module):
     @staticmethod
     def bidirectional_mask_mode(b, h, q_idx, kv_idx):
         return torch.ones_like(q_idx, dtype=torch.bool)
+    
+    # if causal_mask is not None:
+    #         # Fused mixed-objective: per-sample causal/bidirectional via score_mod only
+    #         def fused_score_mod(score, b, _, q_idx, kv_idx):
+    #             same_doc = doc_ids[b, q_idx] == doc_ids[b, kv_idx]
+    #             causal_valid = ~causal_mask[b] | (q_idx >= kv_idx)
+    #             return torch.where(same_doc & causal_valid, score, -float("inf"))
+    #         return flex_attention(query, key, value, score_mod=fused_score_mod)
 
     @staticmethod
-    def dual_mask_mode(self, b, h, q_idx, kv_idx):
-        num_causal = int(b * self.causal_ratio)
-        if b <= num_causal:
-            return self.causal_mask_mode(b, h, q_idx, kv_idx)
+    def dual_mask_mode(b, h, q_idx, kv_idx, causal_ratio=0.5):
+        num_causal = b * causal_ratio
+        if b < num_causal:
+            return (q_idx >= kv_idx)
         else:
-            return self.bidirectional_mask_mode(b, h, q_idx, kv_idx)
+            return torch.ones_like(q_idx, dtype=torch.bool)
 
     def _create_block_mask(self, device: torch.device, batch_size: int) -> None:
-        self.mask = create_block_mask(
-            self.dual_mask_mode,
-            batch_size, None, self.sequence_length, self.sequence_length, device=device
-        )
-
-    def set_mode(self, model_type: str) -> None:
-        self.is_causal = model_type == "causal"
-        if self.causal_mask is None or self.bidirectional_mask is None:
-            raise RuntimeError("Attention masks are not initialized. Call create_mask() before switching mode.")
-        self.mask = self.causal_mask if self.is_causal else self.bidirectional_mask
+        self.mask = None
+        # self.mask = create_block_mask(
+        #     partial(self.dual_mask_mode, causal_ratio=self.causal_ratio),
+        #     batch_size, None, self.sequence_length, self.sequence_length, device=device
+        # )
 
     @torch.no_grad()
     def initialize(self, zero_init: bool = False) -> None:
@@ -336,7 +337,7 @@ class SelfAttention(nn.Module):
         else:
             nn.init.trunc_normal_(self.out_proj.weight, mean=0.0, std=std, a=-2*std, b=2*std)
 
-    def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
         hidden_layer = self.pre_norm(hidden_layer.float()).type_as(hidden_layer)
 
         query, key, value = self.qkv_proj(hidden_layer).chunk(3, dim=-1)  # shape: [T, B, H*D]
@@ -351,10 +352,15 @@ class SelfAttention(nn.Module):
 
         query, key = self.rope_embedding(query, key)
 
-        def score_mod(score, b, h, q_idx, kv_idx):
-            return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
+        # def score_mod(score, b, h, q_idx, kv_idx):
+        #     return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
 
-        output = flex_attention(query, key, value, block_mask=self.mask, score_mod=score_mod)
+        def score_mod(score, b, h, q_idx, kv_idx):
+            same_doc = doc_ids[b, q_idx] == doc_ids[b, kv_idx]
+            causal_valid = ~causal_mask[b] | (q_idx >= kv_idx)
+            return torch.where(same_doc & causal_valid, score, -float("inf"))
+
+        output = flex_attention(query, key, value, score_mod=score_mod)
 
         output = output.permute(2, 0, 1, 3).flatten(2, 3)  # shape: [T, B, H*D]
         output = self.out_proj(output)
