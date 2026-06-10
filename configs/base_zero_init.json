@@ -1,0 +1,19 @@
+{
+    "attention_pre_norm_affine": true,
+    "classifier_pre_norm_affine": true,
+    "d_h": 64,
+    "feed_forward_pre_norm_affine": true,
+    "hidden_size": 768,
+    "intermediate_size": 3072,
+    "max_sequence_length": 2048,
+    "model": "Base",
+    "norm_eps": 1e-07,
+    "num_attention_heads": 12,
+    "num_layers": 12,
+    "rope_theta": 10000,
+    "vocab_size": 128000,
+    "tie_weights": false,
+    "zero_init": true,
+    "projection": true,
+    "use_liger": false
+}
