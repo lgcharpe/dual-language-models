@@ -6,7 +6,7 @@ from dual_language_models.optimizers.muon_utils import COEFF_LIST, muon_update, 
 
 class SingleDeviceMuon(torch.optim.Optimizer):
     
-    def __init__(self, param_groups, ns_steps: int = 5, coeffs: str = "jordan", kimi_adjust_lr: bool = False, normuon: bool = False, polar_express: bool = False, hyperball: bool = False):
+    def __init__(self, param_groups, ns_steps: int = 5, coeffs: str = "jordan", kimi_adjust_lr: bool = False, ratio_adjust_lr: bool = False, normuon: bool = False, polar_express: bool = False, hyperball: bool = False):
         for group in param_groups:
             if group.get("use_muon", False):
                 group["lr"] = group.get("lr", 0.02)
@@ -15,7 +15,8 @@ class SingleDeviceMuon(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0)
                 group["coeff_list"] = group.get("coeff_list", COEFF_LIST[coeffs])
                 group["ns_steps"] = group.get("ns_steps", ns_steps)
-                assert {"params", "lr", "momentum", "beta2", "weight_decay", "coeff_list", "ns_steps", "use_muon"} <= set(group.keys())
+                group["lr_mul"] = group.get("lr_mul", 1)
+                assert {"params", "lr", "lr_mul", "momentum", "beta2", "weight_decay", "coeff_list", "ns_steps", "use_muon"} <= set(group.keys())
             elif group.get("use_adamh", False):
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
@@ -31,6 +32,7 @@ class SingleDeviceMuon(torch.optim.Optimizer):
         super().__init__(param_groups, dict())
         self.normuon = normuon
         self.kimi_adjust_lr = kimi_adjust_lr
+        self.ratio_adjust_lr = ratio_adjust_lr
         self.polar_express = polar_express
         self.hyperball = hyperball
 
@@ -53,13 +55,16 @@ class SingleDeviceMuon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                         state["R"] = p.norm()
+                        if self.kimi_adjust_lr:
+                            state["lr_adjust"] = 0.2 * max(p.size(-1), p.size(-2))**0.5
+                        elif self.ratio_adjust_lr:
+                            state["lr_adjust"] = (max(p.size(-2), p.size(-1)) / min(p.size(-2), p.size(-1)))**0.5
+                        else:
+                            state["lr_adjust"] = max(1, p.size(-2) / p.size(-1))**0.5
                     update = muon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                          beta=group["momentum"], beta2=group["beta2"], normuon=self.normuon,
                                          polar=self.polar_express, coeff_list=group["coeff_list"], ns_steps=group["ns_steps"])
-                    if self.kimi_adjust_lr:
-                        eff_lr = group["lr"] * 0.2 * max(p.size(-1), p.size(-2))**0.5
-                    else:
-                        eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5
+                    eff_lr = group["lr"] * state["lr_adjust"] * group["lr_mul"]
                     if self.hyperball:
                         update = hyperball_update(p, update, state["R"], eff_lr)
                     else:
@@ -103,7 +108,7 @@ class SingleDeviceMuon(torch.optim.Optimizer):
 
 class DistributedMuon(torch.optim.Optimizer):
     
-    def __init__(self, param_groups, ns_steps: int = 5, coeffs: str = "jordan", kimi_adjust_lr: bool = False, normuon: bool = False, polar_express: bool = False, hyperball: bool = False):
+    def __init__(self, param_groups, ns_steps: int = 5, coeffs: str = "jordan", kimi_adjust_lr: bool = False, ratio_adjust_lr: bool = False, normuon: bool = False, polar_express: bool = False, hyperball: bool = False):
         for group in param_groups:
             if group.get("use_muon", False):
                 group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
@@ -114,7 +119,8 @@ class DistributedMuon(torch.optim.Optimizer):
                 group["eps"] = group.get("eps", 1e-10)
                 group["coeff_list"] = group.get("coeff_list", COEFF_LIST[coeffs])
                 group["ns_steps"] = group.get("ns_steps", ns_steps)
-                assert {"params", "lr", "momentum", "beta2", "weight_decay", "coeff_list", "ns_steps", "use_muon"} <= set(group.keys())
+                group["lr_mul"] = group.get("lr_mul", 1)
+                assert {"params", "lr", "lr_mul", "momentum", "beta2", "weight_decay", "coeff_list", "ns_steps", "use_muon"} <= set(group.keys())
             elif group.get("use_adamh", False):
                 group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
                 group["lr"] = group.get("lr", 3e-4)
@@ -132,6 +138,7 @@ class DistributedMuon(torch.optim.Optimizer):
         super().__init__(param_groups, dict())
         self.normuon = normuon
         self.kimi_adjust_lr = kimi_adjust_lr
+        self.ratio_adjust_lr = ratio_adjust_lr
         self.polar_express = polar_express
         self.hyperball = hyperball
 
@@ -158,13 +165,16 @@ class DistributedMuon(torch.optim.Optimizer):
                             state["momentum_buffer"] = torch.zeros_like(p)
                             state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                             state["R"] = p.norm()
+                            if self.kimi_adjust_lr:
+                                state["lr_adjust"] = 0.2 * max(p.size(-1), p.size(-2))**0.5
+                            elif self.ratio_adjust_lr:
+                                state["lr_adjust"] = (max(p.size(-2), p.size(-1)) / min(p.size(-2), p.size(-1)))**0.5
+                            else:
+                                state["lr_adjust"] = max(1, p.size(-2) / p.size(-1))**0.5
                         update = muon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                             beta=group["momentum"], beta2=group["beta2"], normuon=self.normuon,
                                             polar=self.polar_express, coeff_list=group["coeff_list"], ns_steps=group["ns_steps"])
-                        if self.kimi_adjust_lr:
-                            eff_lr = group["lr"] * 0.2 * max(p.size(-1), p.size(-2))**0.5
-                        else:
-                            eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5
+                        eff_lr = group["lr"] * state["lr_adjust"] * group["lr_mul"]
                         if self.hyperball:
                             update = hyperball_update(p, update, state["R"], eff_lr)
                         else:
