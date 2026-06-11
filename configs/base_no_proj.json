@@ -15,5 +15,6 @@
     "tie_weights": false,
     "zero_init": false,
     "projection": false,
-    "use_liger": true
+    "use_liger": true,
+    "std_init_style": "default"
 }
