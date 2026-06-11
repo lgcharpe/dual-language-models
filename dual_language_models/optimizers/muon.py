@@ -57,15 +57,15 @@ class SingleDeviceMuon(torch.optim.Optimizer):
                                          beta=group["momentum"], beta2=group["beta2"], normuon=self.normuon,
                                          polar=self.polar_express, coeff_list=group["coeff_list"], ns_steps=group["ns_steps"])
                     if self.kimi_adjust_lr:
-                        update *= 0.2 * max(p.size(-1), p.size(-2))**0.5
+                        eff_lr = group["lr"] * 0.2 * max(p.size(-1), p.size(-2))**0.5
                     else:
-                        update *= max(1, p.size(-2) / p.size(-1))**0.5
+                        eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5
                     if self.hyperball:
-                        update = hyperball_update(p, update, state["R"], group["lr"])
+                        update = hyperball_update(p, update, state["R"], eff_lr)
                     else:
                         if group["weight_decay"] and had_grad:
                             p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                        p.add_(update.reshape(p.shape), alpha=-eff_lr)
             elif group["use_adamh"]:
                 for p in group["params"]:
                     had_grad = p.grad is not None
