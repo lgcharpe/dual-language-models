@@ -71,6 +71,7 @@ def parse_arguments():
     parser.add_argument("--optimizer", default="muon", type=str, choices=["muon", "adamw"])
     parser.add_argument("--coeffs", default="jordan", type=str, help="Which set of coefficients to use for the Muon optimizer's polynomial approximation.", choices=["jordan", "polar_default", "polar_five_iter"])
     parser.add_argument("--kimi_adjust_lr", action="store_true", help="Whether to adjust the learning rate according to the KIMI paper's suggestion (dividing by sqrt(t) after each step).")
+    parser.add_argument("--ratio_adjust_lr", action="store_true", help="Whether to adjust the learning rate according to the ratio of the dimensions of the parameter matrix, as suggested by some analyses of the Muon update.")
     parser.add_argument("--muonh", action="store_true", help="Whether to use the MuonH optimizer, which applies the Muon update to a subset of parameters and AdamW to the rest.")
     parser.add_argument("--normuon", action="store_true", help="Whether to use the NorMuon optimizer, which is a variant of Muon that normalizes the update to have the same norm as the original gradient.")
     parser.add_argument("--polar_express", action="store_true", help="Whether to use the Polar Express approximation in the Muon optimizer.")
@@ -181,12 +182,14 @@ def prepare_model_and_optimizer(args):
         else:
             other_params.append(("classifier.emb2vocab.weight", model.classifier.emb2vocab.weight))
 
-    muon_parameters = [p for _, p in matrix_params]
+    muon_parameters = [p for n, p in matrix_params if "down_proj" not in n]
+    muon_2_parameters = [p for n, p in matrix_params if "down_proj" in n]
     adamw_parameters = [p for _, p in other_params]
     adamh_parameters = [p for _, p in adamh_params]
 
     param_groups = [
         {"params": muon_parameters, "use_muon": True, "lr": args.learning_rate, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95, "use_adamh": False},
+        {"params": muon_2_parameters, "use_muon": True, "lr": args.learning_rate, "lr_mul": 2.0, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95, "use_adamh": False},
         {"params": adamw_parameters, "use_muon": False, "lr": args.adam_learning_rate, "weight_decay": 0.0, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2), "use_adamh": False},
     ]
 
