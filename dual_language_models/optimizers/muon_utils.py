@@ -6,7 +6,7 @@ import torch
 from dual_language_models.optimizers.polar_express import optimal_composition
 
 COEFF_LIST = {
-    "jordan": (3.4445, -4.7750,  2.0315),
+    "jordan": [(3.4445, -4.7750,  2.0315)],
     "polar_five_iter": optimal_composition(l=1e-3, num_iters=5, safety_factor_eps=1e-2, cushion=0.02),
     "polar_default": optimal_composition(l=1e-3, num_iters=10, safety_factor_eps=1e-2, cushion=0.02),
 }
@@ -42,7 +42,7 @@ def zeropower_via_newtonschulz5(G, steps=5, coeff_list=COEFF_LIST["jordan"]):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
+    a, b, c = coeff_list[0]  
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT

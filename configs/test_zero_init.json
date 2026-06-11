@@ -13,7 +13,7 @@
     "rope_theta": 10000,
     "vocab_size": 128000,
     "tie_weights": false,
-    "zero_init": true,
+    "zero_init": false,
     "projection": true,
     "use_liger": false
 }
