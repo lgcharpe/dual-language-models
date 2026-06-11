@@ -3,6 +3,7 @@ import torch.distributed as dist
 import os
 import random
 import math
+import warnings
 
 
 def cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, min_factor: float):
@@ -127,10 +128,29 @@ class CosineWDSchedule(object):
 
 
 def seed_everything(seed_value=42):
-    os.environ['PYTHONHASHSEED'] = str(seed_value)
+    # PYTHONHASHSEED only affects interpreter hash randomization when set before process start.
+    # Keep behavior explicit: validate and warn instead of pretending to set it for this process.
+    hash_seed = os.environ.get("PYTHONHASHSEED")
+    if hash_seed is None:
+        warnings.warn(
+            "PYTHONHASHSEED is not set. Set it before launching Python for fully reproducible hashing.",
+            stacklevel=2,
+        )
+    elif hash_seed != str(seed_value):
+        warnings.warn(
+            f"PYTHONHASHSEED={hash_seed} differs from training seed {seed_value}.",
+            stacklevel=2,
+        )
+
+    # Ensure deterministic behavior where supported by CUDA kernels/libraries.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed_value)
     torch.manual_seed(seed_value)
     torch.cuda.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def get_rank():

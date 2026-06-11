@@ -1,26 +1,19 @@
-import os
 import sys
-import os.path
 import argparse
 from tqdm import tqdm
-from socket import gethostname
 import json
 import math
-import time
 from pathlib import Path
-from contextlib import nullcontext
-import datetime
 
 from tokenizers import Tokenizer
 import torch
 import torch.nn as nn
 import torch._dynamo
 
+import wandb
+
 from dual_language_models.model.model_single_gpu import Model
-from dual_language_models.optimizers.kimi_muon import Muon
-from dual_language_models.optimizers.normuon import SingleDeviceNorMuonWithAuxAdam as NorMuon
-from dual_language_models.optimizers.muonh import NorMuonWithAuxAdam as MuonH
-from dual_language_models.optimizers.muonh_vr import NorMuonWithAuxAdam as MuonHVR
+from dual_language_models.optimizers.muon import SingleDeviceMuon as Muon
 from dual_language_models.utils import trapezoid_schedule, MaskScheduler, is_main_process, seed_everything, cosine_schedule_with_warmup, cosine_schedule_with_warmup_cooldown, flat_with_warmup_schedule, trapezoid_schedule_sqrt
 from dual_language_models.pretraining.dataset_single_gpu import ValidationCausalDataset, ValidationMaskedDataset, TrainDataset
 from dual_language_models.metrics import TrainingMetrics
@@ -28,30 +21,28 @@ torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.suppress_errors = True
 torch._dynamo.config.guard_nn_modules = False  # Prevent recompilation when self.mask changes
 
-import wandb
-
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--train_path", default="data/toy_train", required=False, type=Path, help="Train dataset name.")
-    parser.add_argument("--valid_path", default="data/toy_valid", type=Path, help="Path to the validation dataset.")
+    parser.add_argument("--train_path", default="data/train", required=False, type=Path, help="Train dataset name.")
+    parser.add_argument("--valid_path", default="data/valid", type=Path, help="Path to the validation dataset.")
     parser.add_argument("--name", default="Single_GPU_test", type=str, help="Name of the run.")
     parser.add_argument("--wandb_project", default="single_gpu_dual_lm", type=str, help="Name of the WandB project to log into.")
     parser.add_argument("--wandb_entity", default="lgcharpe", type=str, help="The entity to log to on WandB (typically your wandb username).")
     parser.add_argument("--config_file", default="configs/test.json", type=Path, help="The BERT model config")
-    parser.add_argument("--tokenizer_path", default="tokenizers/tokenizer.json", type=Path, help="Path to the tokenizer.")
+    parser.add_argument("--tokenizer_path", default="tokenizers/tokenizer_australis.json", type=Path, help="Path to the tokenizer.")
     parser.add_argument("--output_dir", default="checkpoints", type=Path, help="The output directory where the model checkpoints will be written.")
     parser.add_argument("--checkpoint_foldername", default=None, type=Path, help="The checkpoint filename to resume training.")
     parser.add_argument("--causal_ratio", default=0.5, type=float, help="The ratio of causal tokens in the hybrid model.")
     parser.add_argument("--max_seq_length", default=512, type=int, help="Sequence length for training.")
-    parser.add_argument("--local_batch_size", default=4, type=int, help="Batch size for training per GPU.")
-    parser.add_argument("--global_batch_size", default=16, type=int, help="Total batch size for training per GPUs and per grad accumulation step.")
-    parser.add_argument("--learning_rate", default=7e-3, type=float, help="The initial learning rate for AdamW.")
-    parser.add_argument("--adam_learning_rate", default=5e-4, type=float, help="The learning rate for Adam optimizer.")
-    parser.add_argument("--number_of_tokens", default=163_840, type=int, help="Total number of tokens to train on.")
-    parser.add_argument("--max_steps", default=20, type=int)
-    parser.add_argument("--validate_every", default=2, type=int, help="Run validation after every X training steps.")
+    parser.add_argument("--local_batch_size", default=16, type=int, help="Batch size for training per GPU.")
+    parser.add_argument("--global_batch_size", default=128, type=int, help="Total batch size for training per GPUs and per grad accumulation step.")
+    parser.add_argument("--learning_rate", default=1e-2, type=float, help="The initial learning rate for AdamW.")
+    parser.add_argument("--adam_learning_rate", default=5e-3, type=float, help="The learning rate for Adam optimizer.")
+    parser.add_argument("--number_of_tokens", default=1_048_576_000, type=int, help="Total number of tokens to train on.")
+    parser.add_argument("--max_steps", default=16000, type=int)
+    parser.add_argument("--validate_every", default=1000, type=int, help="Run validation after every X training steps.")
     parser.add_argument("--validation_steps", default=1, type=int, help="Number of validation steps.")
     parser.add_argument("--scheduler", default="flat", type=str, help="Which learning rate scheduler to use.", choices=["trapezoid", "cosine", "flat"])
     parser.add_argument("--warmup_proportion", default=0.0, type=float, help="Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10%% of training.")
@@ -59,7 +50,7 @@ def parse_arguments():
     parser.add_argument('--seed', type=int, default=42, help="random seed for initialization")
     parser.add_argument('--save_every', type=int, default=2, help="save every X steps")
     parser.add_argument("--checkpoint_style", default="exp", type=str, help="The style of checkpointing", choices=["linear", "exp"])
-    parser.add_argument("--first_checkpoint", default=10.0, type=float, help="Represents the number of tokens/steps at which to save the first checkpoint.")
+    parser.add_argument("--first_checkpoint", default=500, type=float, help="Represents the number of tokens/steps at which to save the first checkpoint.")
     parser.add_argument('--checkpoint_every', type=int, default=1e8, help="create a model chekpoint every X tokens/steps after the initial checkpoint.")
     parser.add_argument("--checkpoint_mult", default=math.sqrt(2), type=float, help="Checkpoint every power of X steps/tokens (times a initial checkpoint).")
     parser.add_argument("--checkpoint_on", default="steps", type=str, help="What to checkpoint on.")
@@ -76,9 +67,14 @@ def parse_arguments():
     parser.add_argument("--max_gradient", default=1e9, type=float, help="Max value for gradient clipping.")
     parser.add_argument('--n_special_tokens', default=16, type=int, help="Number of special tokens.")
     parser.add_argument('--z_loss_weight', default=0.0001, type=float, help="Weight for the z loss.")
-    parser.add_argument("--experiment", default="dataset_size", type=str)
-    parser.add_argument("--optimizer", default="normuon", type=str, choices=["muon", "normuon", "adamw", "muonh", "muonh_vr"])
-    parser.add_argument("--polar_express", action="store_true", help="Whether to use the Polar Express approximation in the NorMuon optimizer.")
+    parser.add_argument("--experiment", default="long_test", type=str)
+    parser.add_argument("--optimizer", default="muon", type=str, choices=["muon", "adamw"])
+    parser.add_argument("--coeffs", default="jordan", type=str, help="Which set of coefficients to use for the Muon optimizer's polynomial approximation.", choices=["jordan", "polar_default", "polar_five_iter"])
+    parser.add_argument("--kimi_adjust_lr", action="store_true", help="Whether to adjust the learning rate according to the KIMI paper's suggestion (dividing by sqrt(t) after each step).")
+    parser.add_argument("--muonh", action="store_true", help="Whether to use the MuonH optimizer, which applies the Muon update to a subset of parameters and AdamW to the rest.")
+    parser.add_argument("--normuon", action="store_true", help="Whether to use the NorMuon optimizer, which is a variant of Muon that normalizes the update to have the same norm as the original gradient.")
+    parser.add_argument("--polar_express", action="store_true", help="Whether to use the Polar Express approximation in the Muon optimizer.")
+    parser.add_argument("--ns_steps", default=5, type=int, help="Number of Newton-Schulz steps to perform in the Muon optimizer.")
     parser.add_argument("--untie", default=True, action="store_true")
     parser.add_argument("--momentum", default=0.95, type=float)
     parser.add_argument("--n_repetitions", default=64, type=int, help="Number of times to repeat the dataset.")
@@ -209,30 +205,15 @@ def prepare_model_and_optimizer(args):
 
     if args.optimizer == "muon":
         optimizer = Muon(
-            muon_params=muon_parameters,
-            lr=args.learning_rate,
-            wd=args.weight_decay,
-            momentum=args.momentum,
-            nesterov=True,
-            ns_steps=5,
-            adamw_params=adamw_parameters
-        )
-    elif args.optimizer == "normuon":
-        optimizer = NorMuon(
             param_groups,
-            polar_express=args.polar_express
+            ns_steps=args.ns_steps,
+            coeffs=args.coeffs,
+            kimi_adjust_lr=args.kimi_adjust_lr,
+            normuon=args.normuon,
+            polar_express=args.polar_express,
+            hyperball=args.muonh,
         )
-    elif args.optimizer == "muonh":
-        optimizer = MuonH(
-            param_groups,
-            polar_express=args.polar_express
-        )
-    elif args.optimizer == "muonh_vr":
-        optimizer = MuonHVR(
-            param_groups,
-            polar_express=args.polar_express
-        )
-
+    
 
     if args.scheduler == "trapezoid":
         lr_scheduler = trapezoid_schedule(
@@ -308,10 +289,10 @@ def prepare_model_and_optimizer(args):
 @torch.no_grad()
 def get_batch(args, dataset):
     batch = dataset.next(args.local_batch_size)
-    input_ids, target_ids, doc_ids, mask_p = [t.cuda(non_blocking=True) for t in batch]
+    input_ids, target_ids, doc_ids, mask_p, causal_mask = [t.cuda(non_blocking=True) for t in batch]
     input_ids, target_ids, mask_p = input_ids.t(), target_ids.t(), mask_p.t()
 
-    return input_ids, target_ids, doc_ids, mask_p
+    return input_ids, target_ids, doc_ids, mask_p, causal_mask
 
 
 def calculate_num_causal_tokens(target_ids):
@@ -344,7 +325,7 @@ def training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, vali
     training_metrics = TrainingMetrics(
         num_params=sum(p.numel() for p in model.parameters() if p.requires_grad),
         seq_len=args.max_seq_length,
-        world_size=args.world_size,
+        world_size=1,
         device=args.device,
         peak_flops_per_sec=989e12  # Set this if you have the peak FLOPS of your device
     )
@@ -368,12 +349,12 @@ def training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, vali
 
         next_batch = get_batch(args, train_dataset)
 
-        input_ids, target_ids, doc_ids, mask_p = next_batch
+        input_ids, target_ids, doc_ids, mask_p, causal_mask = next_batch
         num_causal_tokens, num_causal_sequences = calculate_num_causal_tokens(target_ids)
 
         # forward pass, do a more detailed check of the model every 100 steps
         # with ModelLogger(enable=global_step % 100 == 0, module=model):
-        output = ddp_model(input_ids, doc_ids, target_ids)
+        output = ddp_model(input_ids, doc_ids, causal_mask, target_ids)
 
         loss, accuracy, z_loss, _ = output.loss, output.accuracy, output.z_loss, output.num_tokens
 
@@ -381,7 +362,7 @@ def training_loop(model, ddp_model, train_dataset, valid_diffusion_dataset, vali
         diffusion_loss = torch.zeros_like(causal_loss)
         if args.causal_ratio < 1.0:
             diffusion_weight = 1.0 / mask_p[target_ids[:, num_causal_sequences:] != -100]
-            diffusion_loss = ((loss.detach()[num_causal_tokens:] / diffusion_weight) / input_ids[:, num_causal_sequences:].numel()).sum()
+            diffusion_loss = ((loss.detach()[num_causal_tokens:] * diffusion_weight) / input_ids[:, num_causal_sequences:].numel()).sum()
 
         causal_accuracy = accuracy[:num_causal_tokens].mean()
         diffusion_accuracy = torch.zeros_like(causal_accuracy)
@@ -502,11 +483,11 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
         local_step = 0
         valid_steps = 0
         for batch in valid_dataset.iterate_over_all(args.max_seq_length, args.local_batch_size):
-            input_ids, target_ids, doc_ids, mask_p = [t.cuda(non_blocking=True) for t in batch]
+            input_ids, target_ids, doc_ids, mask_p, causal_mask = [t.cuda(non_blocking=True) for t in batch]
             input_ids, target_ids = input_ids.t(), target_ids.t()
             mask_p = mask_p.mean()
 
-            output = ddp_model(input_ids, doc_ids, target_ids)
+            output = ddp_model(input_ids, doc_ids, causal_mask, target_ids)
             local_step += 1
 
             loss, accuracy, z_loss, _ = output.loss, output.accuracy, output.z_loss, output.num_tokens
@@ -518,7 +499,7 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
 
             # add the tracked metrics (for gradient accumulation)
             total_loss += loss.detach() / num_steps
-            total_accuracy += accuracy / num_steps
+            total_accuracy += accuracy.mean().item() / num_steps
             total_z_loss += z_loss.detach() / num_steps
             total_mask_p += mask_p / num_steps
 
@@ -586,7 +567,7 @@ def load_train_dataset(args, tokenizer, global_step=0):
 
     train_dataset = TrainDataset(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, args.seed, causal_ratio=args.causal_ratio, shuffle=True)
     if global_step > 0:
-        num_sequences_seen = global_step * (args.global_batch_size // args.world_size)
+        num_sequences_seen = global_step * (args.global_batch_size)
         train_dataset.load_state_from_num_sequences_seen(num_sequences_seen)
 
     # train_diffusion_dataset = DiffusionDatasetv2(args.train_path, tokenizer, args, args.max_seq_length, args.shard_ranks, shuffle=True)
