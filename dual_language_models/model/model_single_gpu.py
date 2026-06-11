@@ -235,11 +235,16 @@ class Classifier(nn.Module):
             self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
         self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=True)
 
-        self.initialize(config.hidden_size, config.vocab_size, config.tie_weights, embedding_weights)
+        self.initialize(config.hidden_size, config.vocab_size, config.tie_weights, embedding_weights, config.std_init_style)
 
     @torch.no_grad()
-    def initialize(self, hidden_size: int, vocab_size: int, tie_weights: bool, embedding_weights: nn.Parameter) -> None:
-        proj_std: float = math.sqrt(2.0 / (hidden_size + 4*hidden_size))
+    def initialize(self, hidden_size: int, vocab_size: int, tie_weights: bool, embedding_weights: nn.Parameter, std_init_style: str = "default") -> None:
+        if std_init_style == "default":
+            proj_std: float = math.sqrt(2.0 / (hidden_size + 4*hidden_size))
+        elif std_init_style == "in_size_only":
+            proj_std = math.sqrt(1.0 / hidden_size)
+        else:
+            raise ValueError(f"Unknown std_init_style: {std_init_style}")
 
         if hasattr(self, "projection"):
             nn.init.trunc_normal_(self.projection.weight, mean=0.0, std=proj_std, a=-2*proj_std, b=2*proj_std)
@@ -294,7 +299,7 @@ class SelfAttention(nn.Module):
         self.sequence_length = config.max_sequence_length
         self.mask = None
 
-        self.initialize(config.zero_init)
+        self.initialize(config.zero_init, config.std_init_style)
 
     @staticmethod
     def causal_mask_mode(b, h, q_idx, kv_idx):
@@ -328,8 +333,14 @@ class SelfAttention(nn.Module):
         # )
 
     @torch.no_grad()
-    def initialize(self, zero_init: bool = False) -> None:
-        std: float = math.sqrt(2.0 / (self.hidden_size + 4*self.hidden_size))
+    def initialize(self, zero_init: bool = False, std_init_style: str = "default") -> None:
+        if std_init_style == "default":
+            std: float = math.sqrt(2.0 / (self.hidden_size + 4*self.hidden_size))
+        elif std_init_style == "in_size_only":
+            std = math.sqrt(1.0 / self.hidden_size)
+        else:
+            raise ValueError(f"Unknown std_init_style: {std_init_style}")
+
         for weight in self.qkv_proj.weights:
             nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2*std, b=2*std)
         if zero_init:
@@ -383,11 +394,16 @@ class FeedForward(nn.Module):
         self.activation = SwiGLU()
         self.down_proj = CastedLinear(config.intermediate_size, config.hidden_size, bias=False)
 
-        self.initialize(config.hidden_size, config.zero_init)
+        self.initialize(config.hidden_size, config.intermediate_size, config.zero_init, config.std_init_style)
 
     @torch.no_grad()
-    def initialize(self, hidden_size: int, zero_init: bool = False) -> None:
-        std: float = math.sqrt(2.0 / (5*hidden_size))
+    def initialize(self, hidden_size: int, intermediate_size: int, zero_init: bool = False, std_init_style: str = "default") -> None:
+        if std_init_style == "default":
+            std: float = math.sqrt(2.0 / (5*hidden_size))
+        elif std_init_style == "in_size_only":
+            std = math.sqrt(1.0 / hidden_size)
+        else:
+            raise ValueError(f"Unknown std_init_style: {std_init_style}")
 
         for weight in self.up_proj.weights:
             nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2*std, b=2*std)
@@ -395,6 +411,8 @@ class FeedForward(nn.Module):
         if zero_init:
             self.down_proj.weight.data.zero_()
         else:
+            if std_init_style == "in_size_only":
+                std = math.sqrt(1.0 / intermediate_size)
             nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=std, a=-2*std, b=2*std)
 
     def up_project(self, hidden_layer: torch.Tensor) -> torch.Tensor:
