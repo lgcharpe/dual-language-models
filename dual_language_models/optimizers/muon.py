@@ -176,7 +176,7 @@ class DistributedMuon(torch.optim.Optimizer):
                                             polar=self.polar_express, coeff_list=group["coeff_list"], ns_steps=group["ns_steps"])
                         eff_lr = group["lr"] * state["lr_adjust"] * group["lr_mul"]
                         if self.hyperball:
-                            update = hyperball_update(p, update, state["R"], eff_lr)
+                            update = hyperball_update(p, update, state["R"], group["lr"])
                         else:
                             if group["weight_decay"] and had_grad:
                                 p.mul_(1 - group["lr"] * group["weight_decay"])

@@ -86,6 +86,7 @@ def parse_arguments():
     parser.add_argument("--optimizer", default="muon", type=str, choices=["muon", "adamw"])
     parser.add_argument("--coeffs", default="jordan", type=str, help="Which set of coefficients to use for the Muon optimizer's polynomial approximation.", choices=["jordan", "polar_default", "polar_five_iter"])
     parser.add_argument("--kimi_adjust_lr", action="store_true", help="Whether to adjust the learning rate according to the KIMI paper's suggestion (dividing by sqrt(t) after each step).")
+    parser.add_argument("--ratio_adjust_lr", action="store_true", help="Whether to adjust the learning rate according to the KIMI paper's suggestion (dividing by sqrt(t) after each step).")
     parser.add_argument("--muonh", action="store_true", help="Whether to use the MuonH optimizer, which applies the Muon update to a subset of parameters and AdamW to the rest.")
     parser.add_argument("--normuon", action="store_true", help="Whether to use the NorMuon optimizer, which is a variant of Muon that normalizes the update to have the same norm as the original gradient.")
     parser.add_argument("--polar_express", action="store_true", help="Whether to use the Polar Express approximation in the Muon optimizer.")
@@ -235,18 +236,20 @@ def prepare_model_and_optimizer(args):
             matrix_params.append(("classifier.projection.weight", model.classifier.projection.weight))
     other_params = [(n, p) for n, p in model.named_parameters() if p.ndim != 2]
     other_params.append(("embedding.word_embedding.weight", model.embedding.word_embedding.weight))
-    if args.untie:
+    if not args.tie_weights:
         if args.classifier_adamh:
             adamh_params.append(("classifier.emb2vocab.weight", model.classifier.emb2vocab.weight))
         else:
             other_params.append(("classifier.emb2vocab.weight", model.classifier.emb2vocab.weight))
 
-    muon_parameters = [p for _, p in matrix_params]
+    muon_parameters = [p for n, p in matrix_params if "down_proj" not in n]
+    muon_2_parameters = [p for n, p in matrix_params if "down_proj" in n]
     adamw_parameters = [p for _, p in other_params]
     adamh_parameters = [p for _, p in adamh_params]
 
     param_groups = [
         {"params": muon_parameters, "use_muon": True, "lr": args.learning_rate, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95, "use_adamh": False},
+        {"params": muon_2_parameters, "use_muon": True, "lr": args.learning_rate, "lr_mul": 1.0, "weight_decay": args.weight_decay, "momentum": args.momentum, "beta2": 0.95, "use_adamh": False},
         {"params": adamw_parameters, "use_muon": False, "lr": args.adam_learning_rate, "weight_decay": 0.0, "eps": args.optimizer_eps, "betas": (args.optimizer_beta1, args.optimizer_beta2), "use_adamh": False},
     ]
 
@@ -270,53 +273,63 @@ def prepare_model_and_optimizer(args):
             ns_steps=args.ns_steps,
             coeffs=args.coeffs,
             kimi_adjust_lr=args.kimi_adjust_lr,
+            ratio_adjust_lr=args.ratio_adjust_lr,
             normuon=args.normuon,
             polar_express=args.polar_express,
             hyperball=args.muonh,
         )
 
+    if args.warmup_proportion > 1:
+        warmup_steps = int(args.warmup_proportion)
+    else:
+        warmup_steps = int(args.max_steps * args.warmup_proportion)
+
+    if args.cooldown_proportion > 1:
+        cooldown_steps = int(args.cooldown_proportion)
+    else:
+        cooldown_steps = int(args.max_steps * args.cooldown_proportion)
 
     if args.scheduler == "trapezoid":
         lr_scheduler = trapezoid_schedule(
             optimizer,
-            int(args.max_steps * args.warmup_proportion),
-            int(args.max_steps * args.cooldown_proportion),
+            warmup_steps,
+            cooldown_steps,
             args.max_steps
         )
     elif args.scheduler == "trapezoid_sqrt":
         lr_scheduler = trapezoid_schedule_sqrt(
             optimizer,
-            int(args.max_steps * args.warmup_proportion),
-            int(args.max_steps * args.cooldown_proportion),
+            warmup_steps,
+            cooldown_steps,
             args.max_steps
         )
     elif args.scheduler == "cosine":
         lr_scheduler = cosine_schedule_with_warmup(
             optimizer,
-            int(args.max_steps * args.warmup_proportion),
+            warmup_steps,
             args.max_steps,
             min_factor=0.1
         )
     elif args.scheduler == "cosine_cooldown":
         lr_scheduler = cosine_schedule_with_warmup_cooldown(
             optimizer,
-            int(args.max_steps * args.warmup_proportion),
-            int(args.max_steps * args.cooldown_proportion),
+            warmup_steps,
+            cooldown_steps,
             args.max_steps,
             min_factor=0.1
         )
     elif args.scheduler == "flat":
         lr_scheduler = flat_with_warmup_schedule(
             optimizer,
-            int(args.max_steps * args.warmup_proportion),
+            warmup_steps,
             args.max_steps
         )
 
     mask_scheduler = MaskScheduler(
         args.mask_p_min,
         args.mask_p_max,
-        int(args.max_steps * args.warmup_proportion),
-        int(args.max_steps * args.cooldown_proportion),
+        warmup_steps,
+        cooldown_steps,
         args.max_steps
     )
     args.mask_p = args.mask_p_max
@@ -558,6 +571,7 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
     total_loss, total_accuracy, total_z_loss, total_mask_p = 0.0, 0.0, 0.0, 0.0
     local_step = 0
     valid_steps = 0
+    total_valid_steps = args.validation_steps * args.accumulate_steps
 
     # switch_start = time.perf_counter()
     model.change_model_type(args.valid_mask_mode, args.device)
@@ -571,7 +585,7 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
         input_ids, target_ids = input_ids.t(), target_ids.t()
         mask_p = mask_p.mean()
 
-        with ddp_model.no_sync() if (local_step + 1) % args.accumulate_steps != 0 else nullcontext():
+        with ddp_model.no_sync() if (local_step + 1) % total_valid_steps != 0 else nullcontext():
 
             output = ddp_model(input_ids, doc_ids, target_ids)
             local_step += 1
@@ -579,18 +593,18 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
             loss, accuracy, z_loss, _ = output.loss, output.accuracy, output.z_loss, output.num_tokens
             loss, z_loss = loss.mean(), z_loss.mean()
 
-            weight = 1.0 / args.accumulate_steps
+            weight = 1.0 / total_valid_steps
             if mask_p != 0:
                 weight = weight * (mask_p / args.mask_p_max)
 
         # add the tracked metrics (for gradient accumulation)
-        total_loss += loss.detach() / args.accumulate_steps
-        total_accuracy += accuracy / args.accumulate_steps
-        total_z_loss += z_loss.detach() / args.accumulate_steps
-        total_mask_p += mask_p / args.accumulate_steps
+        total_loss += loss.detach() / total_valid_steps
+        total_accuracy += accuracy / total_valid_steps
+        total_z_loss += z_loss.detach() / total_valid_steps
+        total_mask_p += mask_p / total_valid_steps
 
         # gradient accumulation -- if we have accumulated enough gradients, we can perform the optimizer step; otherwise, we just continue and backpropagate through the next batch
-        if (local_step + 1) % args.accumulate_steps != 0:
+        if (local_step + 1) % total_valid_steps != 0:
             continue
 
         # be careful here, not all GPUs work with the same training objective
@@ -634,7 +648,7 @@ def validate(model, ddp_model, valid_diffusion_dataset, valid_causal_dataset, gl
 
         valid_steps += 1
 
-        if valid_steps == args.validation_steps:
+        if local_step >= total_valid_steps:
             break
     
     # switch_start = time.perf_counter()
