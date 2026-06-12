@@ -155,7 +155,7 @@ class Encoder(nn.Module):
 
         self.layers: nn.ModuleList[Layer]
 
-        self.layers = nn.ModuleList([Layer(config) for _ in range(config.num_layers)])
+        self.layers = nn.ModuleList([Layer(config, i+1) for i in range(config.num_layers)])
 
         for i, layer in enumerate(self.layers):
             for weight in layer.mlp.up_proj.weights:
@@ -175,13 +175,13 @@ class Encoder(nn.Module):
 
 class Layer(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, layer_idx: int) -> None:
         super().__init__()
 
         self.attention: SelfAttention
         self.mlp: FeedForward
 
-        self.attention = SelfAttention(config)
+        self.attention = SelfAttention(config, layer_idx)
         self.mlp = FeedForward(config)
 
     def _create_mask(self, device: torch.device) -> None:
@@ -233,7 +233,7 @@ class Classifier(nn.Module):
         self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.classifier_pre_norm_affine)
         if config.projection:
             self.projection = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
-        self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=True)
+        self.emb2vocab = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
 
         self.initialize(config.hidden_size, config.vocab_size, config.tie_weights, embedding_weights, config.std_init_style)
 
@@ -253,7 +253,8 @@ class Classifier(nn.Module):
         else:
             std = math.sqrt(2.0 / (hidden_size + vocab_size))
             nn.init.trunc_normal_(self.emb2vocab.weight, mean=0.0, std=std, a=-2*std, b=2*std)
-        self.emb2vocab.bias.zero_()
+        if self.emb2vocab.bias is not None:
+            self.emb2vocab.bias.zero_()
 
     def project(self, hidden_layer: torch.Tensor) -> torch.Tensor:
         projection: torch.Tensor
@@ -282,16 +283,28 @@ class Classifier(nn.Module):
 
 class SelfAttention(nn.Module):
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, layer_idx: int) -> None:
         super().__init__()
         self.d_h = config.d_h
         self.num_attention_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_kv_heads
         self.hidden_size = config.hidden_size
+        self.q_size = self.d_h * self.num_attention_heads
+        self.kv_size = self.d_h * self.num_kv_heads
+        if layer_idx % config.sliding_window_frequency == 0:
+            self.sliding_window_size = None
+        else:
+            self.sliding_window_size = config.sliding_window_size if hasattr(config, "sliding_window_size") else None
 
-        self.qkv_proj = MultiCastedLinearOrtho(self.hidden_size, [self.hidden_size, self.hidden_size, self.hidden_size], bias=False)
+        self.qkv_proj = MultiCastedLinearOrtho(self.hidden_size, [self.d_h*self.num_attention_heads, self.d_h*self.num_kv_heads, self.d_h*self.num_kv_heads], bias=False)
         self.out_proj = CastedLinear(self.d_h*self.num_attention_heads, self.hidden_size, bias=False)
 
         self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
+        if config.qk_norm:
+            self.q_norm = nn.RMSNorm(self.d_h, elementwise_affine=config.attention_pre_norm_affine, eps=config.norm_eps)
+            self.k_norm = nn.RMSNorm(self.d_h, elementwise_affine=config.attention_pre_norm_affine, eps=config.norm_eps)
+        if config.post_norm:
+            self.post_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.attention_pre_norm_affine)
 
         self.rope_embedding = RotaryPositionalEmbeddings(config)
         self.scale: float = 1.0 / math.sqrt(self.d_h)
@@ -305,22 +318,28 @@ class SelfAttention(nn.Module):
         self.initialize(config.zero_init, config.std_init_style)
 
     @staticmethod
-    def causal_mask_mode(b, h, q_idx, kv_idx):
-        return (q_idx >= kv_idx)
+    def causal_mask_mode(b, h, q_idx, kv_idx, sliding_window_size=None):
+        causal_mask = (q_idx >= kv_idx)
+        if sliding_window_size is not None:
+            causal_mask = causal_mask & (q_idx - kv_idx <= sliding_window_size)
+        return causal_mask
 
     @staticmethod
-    def bidirectional_mask_mode(b, h, q_idx, kv_idx):
-        return torch.ones_like(q_idx, dtype=torch.bool)
+    def bidirectional_mask_mode(b, h, q_idx, kv_idx, sliding_window_size=None):
+        bidirectional_mask = torch.ones_like(q_idx, dtype=torch.bool)
+        if sliding_window_size is not None:
+            bidirectional_mask = (torch.abs(q_idx - kv_idx) <= sliding_window_size)
+        return bidirectional_mask
 
     def _create_block_mask(self, device: torch.device) -> None:
         if self.causal_mask is None:
             self.causal_mask = create_block_mask(
-                self.causal_mask_mode,
+                partial(self.causal_mask_mode, sliding_window_size=self.sliding_window_size),
                 None, None, self.sequence_length, self.sequence_length, device=device
             )
         if self.bidirectional_mask is None:
             self.bidirectional_mask = create_block_mask(
-                self.bidirectional_mask_mode,
+                partial(self.bidirectional_mask_mode, sliding_window_size=self.sliding_window_size),
                 None, None, self.sequence_length, self.sequence_length, device=device
             )
         self.mask = self.causal_mask if self.is_causal else self.bidirectional_mask
@@ -350,25 +369,31 @@ class SelfAttention(nn.Module):
     def forward(self, hidden_layer: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
         hidden_layer = self.pre_norm(hidden_layer.float()).type_as(hidden_layer)
 
-        query, key, value = self.qkv_proj(hidden_layer).chunk(3, dim=-1)  # shape: [T, B, H*D]
+        query, key, value = self.qkv_proj(hidden_layer).tensor_split([self.q_size, self.q_size + self.kv_size], dim=-1)
 
         query_length: int = hidden_layer.size(0)
         key_length: int = hidden_layer.size(0)
         batch_size: int = hidden_layer.size(1)
 
         query = query.reshape(query_length, batch_size, self.num_attention_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
-        key = key.reshape(key_length, batch_size, self.num_attention_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
-        value = value.reshape(key_length, batch_size, self.num_attention_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
+        key = key.reshape(key_length, batch_size, self.num_kv_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
+        value = value.reshape(key_length, batch_size, self.num_kv_heads, self.d_h).permute(1, 2, 0, 3)  # shape: [B, H, T, D]
+
+        if hasattr(self, "q_norm"):
+            query = self.q_norm(query.float()).type_as(query)
+            key = self.k_norm(key.float()).type_as(key)
 
         query, key = self.rope_embedding(query, key)
 
         def score_mod(score, b, h, q_idx, kv_idx):
             return torch.where(doc_ids[b, q_idx] == doc_ids[b, kv_idx], score, -float("inf"))
 
-        output = flex_attention(query, key, value, block_mask=self.mask, score_mod=score_mod)
+        output = flex_attention(query, key, value, block_mask=self.mask, score_mod=score_mod, enable_gqa=True)
 
         output = output.permute(2, 0, 1, 3).flatten(2, 3)  # shape: [T, B, H*D]
         output = self.out_proj(output)
+        if hasattr(self, "post_norm"):
+            output = self.post_norm(output.float()).type_as(output)
 
         return output
 
@@ -384,6 +409,8 @@ class FeedForward(nn.Module):
         self.activation: SwiGLU
 
         self.pre_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
+        if config.post_norm:
+            self.post_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps, elementwise_affine=config.feed_forward_pre_norm_affine)
         self.up_proj = MultiCastedLinearOrtho(config.hidden_size, [config.intermediate_size, config.intermediate_size], bias=False)
         self.activation = SwiGLU()
         self.down_proj = CastedLinear(config.intermediate_size, config.hidden_size, bias=False)
@@ -435,6 +462,8 @@ class FeedForward(nn.Module):
         output = self.up_project(hidden_layer)
         output = self.activate(output)
         output = self.down_project(output)
+        if hasattr(self, "post_norm"):
+            output = self.post_norm(output.float()).type_as(output)
 
         return output
 
